@@ -60,6 +60,8 @@ from connector import (
     IocTrustClusterConnector,
     LABEL_FP_CANDIDATE,
     LABEL_MALICIOUS_CASCADE,
+    LABEL_INHERITED_FP_CANDIDATE,
+    LABEL_INHERITED_MALICIOUS_CASCADE,
     LABEL_SINKHOLED,
     LABEL_ONLY,
     CLUSTER_LABEL_PREFIX,
@@ -112,6 +114,7 @@ def _make_connector(extra_env: dict | None = None) -> IocTrustClusterConnector:
     helper.api.label.create.return_value = {"id": "label-id-stub"}
     helper.api.stix_cyber_observable.add_label.return_value = True
     helper.api.stix_core_relationship.create.return_value   = {"id": "rel-stub"}
+    helper.api.stix_core_relationship.list.return_value     = []
     helper.api.stix_sighting_relationship.list.return_value = []
     helper.api.note.create.return_value = {"id": "note-stub"}
     c.helper = helper
@@ -134,7 +137,7 @@ def _obs(
         "entity_type":       entity_type,
         "value":             value,
         "x_opencti_score":   score,
-        "objectLabel":       [{"value": lbl} for lbl in (labels or [])],
+        "objectLabel":       [{"id": f"label-{i}", "value": lbl} for i, lbl in enumerate(labels or [])],
         "indicators":        [],
     }
     if issuer:
@@ -155,6 +158,22 @@ def _labels_created(helper) -> list[str]:
 
 def _relationship_made(helper) -> bool:
     return helper.api.stix_core_relationship.create.called
+
+
+def _trust_rel(parent: dict) -> dict:
+    return {
+        "description": "IOC trust-cluster structural parent link (auto-created)",
+        "toId": parent["id"],
+        "to": parent,
+    }
+
+
+def _child_rel(child: dict) -> dict:
+    return {
+        "description": "IOC trust-cluster structural parent link (auto-created)",
+        "fromId": child["id"],
+        "from": child,
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -258,34 +277,25 @@ class TestClassifyParent:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestExtractParentIPv4:
-    """IPv4-Addr parent extraction — RDAP disabled (fallback /24)."""
+    """IPv4-Addr parent extraction — ASN/RDAP CIDR only, no random /24."""
 
     @pytest.fixture(autouse=True)
     def con(self):
         self.c = _make_connector()   # use_rdap=False
 
-    def test_public_ip_returns_slash24_fallback(self):
-        p = self.c._extract_parent("IPv4-Addr", "1.2.3.100")
-        assert p == ("IPv4-Addr", "1.2.3.0/24")
-
-    def test_fallback_network_is_correctly_masked(self):
-        # 10.20.30.40 /24 → 10.20.30.0/24  (host bits zeroed)
-        p = self.c._extract_parent("IPv4-Addr", "10.20.30.40")
-        assert p == ("IPv4-Addr", "10.20.30.0/24")
+    def test_public_ip_without_rdap_returns_none(self):
+        assert self.c._extract_parent("IPv4-Addr", "1.2.3.100") is None
 
     def test_cidr_notation_input_returns_none(self):
         # A CIDR observable is itself a parent — no further parent extraction
         assert self.c._extract_parent("IPv4-Addr", "1.2.3.0/24") is None
 
-    def test_private_ip_uses_fallback_not_rdap(self):
-        # Private addresses bypass RDAP and still get a /24 cluster anchor
-        p = self.c._extract_parent("IPv4-Addr", "192.168.1.100")
-        assert p == ("IPv4-Addr", "192.168.1.0/24")
+    def test_private_ip_returns_none(self):
+        assert self.c._extract_parent("IPv4-Addr", "192.168.1.100") is None
 
-    def test_custom_fallback_prefix_respected(self):
+    def test_custom_fallback_prefix_does_not_create_random_parent(self):
         c2 = _make_connector({"TRUST_CLUSTER_CIDR_FALLBACK_PREFIX": "16"})
-        p  = c2._extract_parent("IPv4-Addr", "10.20.30.40")
-        assert p == ("IPv4-Addr", "10.20.0.0/16")
+        assert c2._extract_parent("IPv4-Addr", "10.20.30.40") is None
 
 
 class TestExtractParentIPv4Rdap:
@@ -301,17 +311,14 @@ class TestExtractParentIPv4Rdap:
         assert p == ("IPv4-Addr", "8.8.0.0/16")
         self.c._get_announced_cidr.assert_called_once_with("8.8.8.8")
 
-    def test_rdap_failure_falls_back_to_slash24(self):
+    def test_rdap_failure_returns_none(self):
         self.c._get_announced_cidr = MagicMock(return_value=None)
-        p = self.c._extract_parent("IPv4-Addr", "1.2.3.4")
-        assert p == ("IPv4-Addr", "1.2.3.0/24")
+        assert self.c._extract_parent("IPv4-Addr", "1.2.3.4") is None
 
-    def test_rdap_returns_same_as_value_falls_back(self):
+    def test_rdap_returns_same_as_value_returns_none(self):
         # RDAP shouldn't return a host address, but defend against it
         self.c._get_announced_cidr = MagicMock(return_value="1.2.3.4")
-        # "1.2.3.4" != "1.2.3.4/24", so fallback CIDR is returned
-        p = self.c._extract_parent("IPv4-Addr", "1.2.3.4")
-        assert p == ("IPv4-Addr", "1.2.3.0/24")
+        assert self.c._extract_parent("IPv4-Addr", "1.2.3.4") is None
 
 
 class TestExtractParentIPv6:
@@ -320,10 +327,8 @@ class TestExtractParentIPv6:
     def con(self):
         self.c = _make_connector()   # use_rdap=False
 
-    def test_public_ipv6_returns_slash48_fallback(self):
-        p = self.c._extract_parent("IPv6-Addr", "2001:db8::1")
-        net = str(ipaddress.ip_network("2001:db8::1/48", strict=False))
-        assert p == ("IPv6-Addr", net)
+    def test_public_ipv6_without_rdap_returns_none(self):
+        assert self.c._extract_parent("IPv6-Addr", "2001:db8::1") is None
 
     def test_ipv6_cidr_notation_returns_none(self):
         assert self.c._extract_parent("IPv6-Addr", "2001:db8::/32") is None
@@ -387,9 +392,8 @@ class TestExtractParentUrl:
         p = self.c._extract_parent("Url", "https://api.example.com/v1/data")
         assert p == ("Domain-Name", "example.com")
 
-    def test_url_with_ipv4_host_returns_cidr(self):
-        p = self.c._extract_parent("Url", "http://10.20.30.40/path")
-        assert p == ("IPv4-Addr", "10.20.30.0/24")
+    def test_url_with_ipv4_host_without_rdap_returns_none(self):
+        assert self.c._extract_parent("Url", "http://10.20.30.40/path") is None
 
     def test_url_root_domain_host_returns_none(self):
         assert self.c._extract_parent("Url", "https://example.com/page") is None
@@ -397,16 +401,13 @@ class TestExtractParentUrl:
     def test_url_no_host_returns_none(self):
         assert self.c._extract_parent("Url", "not-a-url") is None
 
-    def test_url_ipv6_host_returns_ipv6_parent(self):
+    def test_url_ipv6_host_routes_through_ipv6_extraction(self):
         """B10: IPv6 URL hosts now route through IPv6-Addr extraction."""
-        p = self.c._extract_parent("Url", "http://[2001:db8::1]/path")
-        expected = str(ipaddress.ip_network("2001:db8::1/48", strict=False))
-        assert p == ("IPv6-Addr", expected)
+        assert self.c._extract_parent("Url", "http://[2001:db8::1]/path") is None
 
-    def test_url_with_port_ipv4_still_works(self):
-        """B10 regression: IPv4 host:port still resolves (urlparse strips port)."""
-        p = self.c._extract_parent("Url", "http://10.20.30.40:8080/path")
-        assert p == ("IPv4-Addr", "10.20.30.0/24")
+    def test_url_with_port_ipv4_still_parses_host(self):
+        """B10 regression: IPv4 host:port still parses (urlparse strips port)."""
+        assert self.c._extract_parent("Url", "http://10.20.30.40:8080/path") is None
 
 
 class TestExtractParentX509:
@@ -415,10 +416,9 @@ class TestExtractParentX509:
     def con(self):
         self.c = _make_connector()
 
-    def test_cert_with_different_issuer_returns_ca_parent(self):
+    def test_cert_with_different_issuer_returns_no_synthetic_parent(self):
         entity = {"issuer": "CN=Root CA,O=Corp", "subject": "CN=leaf.corp.com"}
-        p = self.c._extract_parent("X509-Certificate", "CN=leaf.corp.com", entity)
-        assert p == ("X509-Certificate", "CN=Root CA,O=Corp")
+        assert self.c._extract_parent("X509-Certificate", "CN=leaf.corp.com", entity) is None
 
     def test_self_signed_cert_returns_none(self):
         dn = "CN=SelfSigned,O=Test"
@@ -522,6 +522,53 @@ class TestGetAnnouncedCidr:
         with patch.object(_mod, "IPWhois", return_value=mock_instance):
             result = self.c._get_announced_cidr("8.8.8.8")
         assert result == "8.8.8.0/24"
+
+    def test_non_containing_cidrs_are_ignored(self):
+        mock_instance = MagicMock()
+        mock_instance.lookup_rdap.return_value = self._rdap_result(
+            cidr="9.9.9.0/24, 8.8.0.0/16"
+        )
+        with patch.object(_mod, "IPWhois", return_value=mock_instance):
+            result = self.c._get_announced_cidr("8.8.8.8")
+        assert result == "8.8.0.0/16"
+
+    def test_invalid_cidrs_are_ignored(self):
+        mock_instance = MagicMock()
+        mock_instance.lookup_rdap.return_value = self._rdap_result(
+            cidr="not-a-cidr, 8.8.8.0/24"
+        )
+        with patch.object(_mod, "IPWhois", return_value=mock_instance):
+            result = self.c._get_announced_cidr("8.8.8.8")
+        assert result == "8.8.8.0/24"
+
+    def test_asn_cidr_used_when_network_cidr_unusable(self):
+        mock_instance = MagicMock()
+        mock_instance.lookup_rdap.return_value = {
+            "asn": "15169", "asn_description": "GOOGLE",
+            "network": {"cidr": "9.9.9.0/24"},
+            "asn_cidr": "8.8.8.0/24",
+        }
+        with patch.object(_mod, "IPWhois", return_value=mock_instance):
+            result = self.c._get_announced_cidr("8.8.8.8")
+        assert result == "8.8.8.0/24"
+
+    def test_ipv6_cidr_supported(self):
+        mock_instance = MagicMock()
+        mock_instance.lookup_rdap.return_value = self._rdap_result(
+            cidr="2001:4860::/32, 2001:4860:4860::/48"
+        )
+        with patch.object(_mod, "IPWhois", return_value=mock_instance):
+            result = self.c._get_announced_cidr("2001:4860:4860::8888")
+        assert result == "2001:4860:4860::/48"
+
+    def test_no_containing_cidr_returns_none(self):
+        mock_instance = MagicMock()
+        mock_instance.lookup_rdap.return_value = self._rdap_result(
+            cidr="9.9.9.0/24"
+        )
+        with patch.object(_mod, "IPWhois", return_value=mock_instance):
+            result = self.c._get_announced_cidr("8.8.8.8")
+        assert result is None
 
     def test_ip_defined_error_returns_none(self):
         mock_instance = MagicMock()
@@ -688,6 +735,13 @@ def _wire(con, child, parent=None):
     if parent is not None:
         con.helper.api.stix_cyber_observable.list.return_value = [parent]
         con.helper.api.stix_cyber_observable.create.return_value = parent
+        # Tests that provide an IP CIDR parent are modelling an ASN/RDAP-derived
+        # CIDR. Make that explicit now that random /24 fallback is gone.
+        if "/" in (parent.get("value") or "") and not isinstance(
+            getattr(con, "_get_announced_cidr", None), MagicMock
+        ):
+            con.use_rdap = True
+            con._get_announced_cidr = MagicMock(return_value=parent["value"])
     else:
         con.helper.api.stix_cyber_observable.list.return_value = []
         # create() returns a minimal UNKNOWN parent anchor
@@ -735,7 +789,10 @@ class TestCidrLinking:
 
     @pytest.fixture(autouse=True)
     def con(self):
-        self.c = _make_connector()   # RDAP disabled → /24 fallback
+        self.c = _make_connector({"TRUST_CLUSTER_USE_RDAP": "true"})
+        self.c._get_announced_cidr = MagicMock(
+            side_effect=lambda ip: str(ipaddress.ip_network(f"{ip}/24", strict=False))
+        )
 
     # ── Parent creation ──────────────────────────────────────────────────────
 
@@ -866,6 +923,50 @@ class TestCidrLinking:
         assert created["value"] == "8.8.0.0/16"
 
 
+class TestAsnDerivedCidrParentRegression:
+    """TC4: ASN/RDAP chooses CIDR; OpenCTI reuses/creates that exact parent."""
+
+    def test_existing_opencti_cidr_for_asn_cidr_is_reused(self):
+        c = _make_connector({"TRUST_CLUSTER_USE_RDAP": "true"})
+        c._get_announced_cidr = MagicMock(return_value="8.8.0.0/16")
+        child = _obs(value="8.8.8.8")
+        parent = _obs(entity_id="cidr-001", value="8.8.0.0/16", score=50)
+        _wire(c, child, parent)
+
+        c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
+
+        c.helper.api.stix_cyber_observable.create.assert_not_called()
+        c.helper.api.stix_core_relationship.create.assert_called_once()
+        assert c.helper.api.stix_core_relationship.create.call_args.kwargs["toId"] == "cidr-001"
+
+    def test_missing_asn_cidr_parent_is_created_for_exact_asn_cidr(self):
+        c = _make_connector({"TRUST_CLUSTER_USE_RDAP": "true"})
+        c._get_announced_cidr = MagicMock(return_value="8.8.0.0/16")
+        child = _obs(value="8.8.8.8")
+        parent = _obs(entity_id="cidr-001", value="8.8.0.0/16", score=50)
+        c.helper.api.stix_cyber_observable.read.return_value = child
+        c.helper.api.stix_cyber_observable.list.return_value = []
+        c.helper.api.stix_cyber_observable.create.return_value = parent
+
+        c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
+
+        created = c.helper.api.stix_cyber_observable.create.call_args.kwargs["observableData"]
+        assert created["value"] == "8.8.0.0/16"
+
+    def test_no_usable_rdap_cidr_creates_no_random_parent(self):
+        c = _make_connector({"TRUST_CLUSTER_USE_RDAP": "true"})
+        c._get_announced_cidr = MagicMock(return_value=None)
+        child = _obs(value="8.8.8.8")
+        c.helper.api.stix_cyber_observable.read.return_value = child
+        c.helper.api.stix_cyber_observable.list.return_value = []
+
+        result = c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
+
+        assert "no actions" in result
+        c.helper.api.stix_cyber_observable.create.assert_not_called()
+        c.helper.api.stix_core_relationship.create.assert_not_called()
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Trust propagation (KEY: "trust propagate")
 # ══════════════════════════════════════════════════════════════════════════════
@@ -892,7 +993,7 @@ class TestTrustPropagation:
         result = self.c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
 
         labels = _labels_created(self.c.helper)
-        assert LABEL_MALICIOUS_CASCADE in labels
+        assert LABEL_INHERITED_MALICIOUS_CASCADE in labels
         assert "malicious-cascade" in result
 
     def test_malicious_cidr_cascade_uses_red_color(self):
@@ -904,7 +1005,7 @@ class TestTrustPropagation:
 
         malicious_calls = [
             c for c in self.c.helper.api.label.create.call_args_list
-            if (c.kwargs.get("value") or "") == LABEL_MALICIOUS_CASCADE
+            if (c.kwargs.get("value") or "") == LABEL_INHERITED_MALICIOUS_CASCADE
         ]
         assert len(malicious_calls) >= 1
         assert malicious_calls[0].kwargs["color"] == COLOR_MALICIOUS
@@ -945,7 +1046,7 @@ class TestTrustPropagation:
         result = c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
 
         # malicious-cascade must be added (malicious signal wins)
-        assert LABEL_MALICIOUS_CASCADE in _labels_created(c.helper)
+        assert LABEL_INHERITED_MALICIOUS_CASCADE in _labels_created(c.helper)
         # Dedicated conflict Note created
         conflict_notes = [
             call for call in c.helper.api.note.create.call_args_list
@@ -964,7 +1065,7 @@ class TestTrustPropagation:
 
         malicious_label_calls = [
             c for c in self.c.helper.api.label.create.call_args_list
-            if (c.kwargs.get("value") or "") == LABEL_MALICIOUS_CASCADE
+            if (c.kwargs.get("value") or "") == LABEL_INHERITED_MALICIOUS_CASCADE
         ]
         assert len(malicious_label_calls) == 0, "label already present — no duplicate"
 
@@ -979,7 +1080,7 @@ class TestTrustPropagation:
         result = self.c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
 
         labels = _labels_created(self.c.helper)
-        assert LABEL_FP_CANDIDATE in labels
+        assert LABEL_INHERITED_FP_CANDIDATE in labels
         assert "fp-candidate" in result
 
     def test_fp_candidate_not_propagated_when_child_score_high(self):
@@ -1026,7 +1127,7 @@ class TestTrustPropagation:
         result = self.c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
         assert "skipped" not in result
         # has_malicious=False (string treated as 0), so fp-candidate cascades
-        assert LABEL_FP_CANDIDATE in _labels_created(self.c.helper)
+        assert LABEL_INHERITED_FP_CANDIDATE in _labels_created(self.c.helper)
 
     def test_score_zero_treated_as_zero_not_fifty(self):
         """
@@ -1044,7 +1145,7 @@ class TestTrustPropagation:
 
         c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
 
-        assert LABEL_FP_CANDIDATE in _labels_created(c.helper), (
+        assert LABEL_INHERITED_FP_CANDIDATE in _labels_created(c.helper), (
             "score=0 must cascade fp-candidate; was being read as 50 (falsy gotcha)"
         )
 
@@ -1086,7 +1187,7 @@ class TestTrustPropagation:
 
         c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
 
-        assert LABEL_FP_CANDIDATE in _labels_created(c.helper), (
+        assert LABEL_INHERITED_FP_CANDIDATE in _labels_created(c.helper), (
             "fp-candidate must cascade when child score (≤60 for fp) ≤ "
             "fp_cascade_score_max=65, even though it exceeds unknown_score_max=50"
         )
@@ -1128,7 +1229,7 @@ class TestTrustPropagation:
 
         c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
 
-        assert LABEL_FP_CANDIDATE in _labels_created(c.helper)
+        assert LABEL_INHERITED_FP_CANDIDATE in _labels_created(c.helper)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1173,7 +1274,7 @@ class TestDomainLinking:
 
         self.c.process_message({"entity_id": "obs-001", "entity_type": "Domain-Name"})
 
-        assert LABEL_MALICIOUS_CASCADE in _labels_created(self.c.helper)
+        assert LABEL_INHERITED_MALICIOUS_CASCADE in _labels_created(self.c.helper)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1217,31 +1318,19 @@ class TestX509Linking:
     def con(self):
         self.c = _make_connector()
 
-    def test_cert_linked_to_ca_cert_by_issuer_dn(self):
+    def test_cert_issuer_dn_does_not_create_parent_link(self):
         child = _obs(
             entity_type="X509-Certificate",
             value="CN=leaf",
             issuer="CN=Root CA,O=Corp",
             subject="CN=leaf",
         )
-        ca_parent = _obs(
-            entity_id="ca-001",
-            entity_type="X509-Certificate",
-            value="CN=Root CA,O=Corp",
-            score=50,
-            subject="CN=Root CA,O=Corp",
-        )
-        _wire(self.c, child, ca_parent)
+        _wire(self.c, child)
 
         self.c.process_message({"entity_id": "obs-001", "entity_type": "X509-Certificate"})
 
-        self.c.helper.api.stix_core_relationship.create.assert_called_once_with(
-            fromId="obs-001",
-            toId="ca-001",
-            relationship_type="related-to",
-            description=pytest.approx("IOC trust-cluster structural parent link (auto-created)", abs=0),
-            confidence=75,
-        )
+        self.c.helper.api.stix_core_relationship.create.assert_not_called()
+        self.c.helper.api.stix_cyber_observable.create.assert_not_called()
 
     def test_self_signed_cert_no_parent_link(self):
         dn = "CN=SelfSigned,O=Test"
@@ -1252,36 +1341,20 @@ class TestX509Linking:
 
         self.c.helper.api.stix_core_relationship.create.assert_not_called()
 
-    def test_x509_second_run_finds_existing_ca_no_duplicate(self):
-        """
-        B3 regression: X509 parent must be found via subject-only filter on the
-        second run, not re-created.  The old code ANDed in a 'value' filter that
-        X509 observables never match, causing a new duplicate CA anchor on every
-        enrichment cycle.
-        """
+    def test_x509_issuer_dn_never_creates_duplicate_ca_anchor(self):
         c = _make_connector()
         leaf = _obs(
             entity_type="X509-Certificate", value="CN=leaf",
             issuer="CN=Root CA,O=Corp", subject="CN=leaf",
         )
-        ca = _obs(
-            entity_id="ca-001", entity_type="X509-Certificate",
-            value="CN=Root CA,O=Corp", score=50,
-            subject="CN=Root CA,O=Corp",
-        )
         c.helper.api.stix_cyber_observable.read.return_value = leaf
-
-        # First run: parent absent, create is called
         c.helper.api.stix_cyber_observable.list.return_value = []
-        c.helper.api.stix_cyber_observable.create.return_value = ca
-        c.process_message({"entity_id": "obs-001", "entity_type": "X509-Certificate"})
-        assert c.helper.api.stix_cyber_observable.create.call_count == 1
 
-        # Second run: parent now exists; create must NOT be called again
-        c.helper.api.stix_cyber_observable.list.return_value = [ca]
-        c.helper.api.stix_cyber_observable.create.reset_mock()
         c.process_message({"entity_id": "obs-001", "entity_type": "X509-Certificate"})
+        c.process_message({"entity_id": "obs-001", "entity_type": "X509-Certificate"})
+
         c.helper.api.stix_cyber_observable.create.assert_not_called()
+        c.helper.api.stix_core_relationship.create.assert_not_called()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1582,6 +1655,16 @@ class TestGetAuthoritativeNs:
 
 class TestExtractParentDomainNsLookup:
 
+    def test_ns_lookup_default_is_off(self):
+        env = {k: v for k, v in _ENV_BASE.items() if k != "TRUST_CLUSTER_USE_NS_LOOKUP"}
+        with patch.dict(os.environ, env, clear=True):
+            c = IocTrustClusterConnector()
+        c.helper = MagicMock()
+        c._get_authoritative_ns = MagicMock(return_value='ns1.bulletproof.ru')
+
+        assert c._extract_parent("Domain-Name", "evil.com") is None
+        c._get_authoritative_ns.assert_not_called()
+
     def test_root_domain_returns_ns_parent(self):
         c = _make_connector({"TRUST_CLUSTER_USE_NS_LOOKUP": "true"})
         c._get_authoritative_ns = MagicMock(return_value='ns1.bulletproof.ru')
@@ -1660,7 +1743,7 @@ class TestExtractParentDomainNsLookup:
 
         c.process_message({"entity_id": "obs-001", "entity_type": "Domain-Name"})
 
-        assert LABEL_MALICIOUS_CASCADE in _labels_created(c.helper)
+        assert LABEL_INHERITED_MALICIOUS_CASCADE in _labels_created(c.helper)
 
     def test_benign_ns_propagates_fp_candidate_to_root_domain(self):
         """Root domain under a benign NS inherits fp-candidate."""
@@ -1675,7 +1758,7 @@ class TestExtractParentDomainNsLookup:
 
         c.process_message({"entity_id": "obs-001", "entity_type": "Domain-Name"})
 
-        assert LABEL_FP_CANDIDATE in _labels_created(c.helper)
+        assert LABEL_INHERITED_FP_CANDIDATE in _labels_created(c.helper)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1698,6 +1781,7 @@ class TestAlreadyClustered:
         )
         parent = _obs(entity_id="cidr-001", value="1.2.3.0/24", score=50)
         _wire(c, child, parent)
+        c.helper.api.stix_core_relationship.list.return_value = [_trust_rel(parent)]
         c._extract_parent = MagicMock(wraps=c._extract_parent)
 
         c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
@@ -1711,6 +1795,7 @@ class TestAlreadyClustered:
         child = _obs(value="1.2.3.4", score=50, labels=[cluster_lbl])
         parent = _obs(entity_id="cidr-001", value="1.2.3.0/24", score=50)
         _wire(c, child, parent)
+        c.helper.api.stix_core_relationship.list.return_value = [_trust_rel(parent)]
 
         c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
 
@@ -1732,10 +1817,11 @@ class TestAlreadyClustered:
         # Parent is now malicious (score changed since first processing)
         parent = _obs(entity_id="cidr-001", value="1.2.3.0/24", score=85)
         _wire(c, child, parent)
+        c.helper.api.stix_core_relationship.list.return_value = [_trust_rel(parent)]
 
         c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
 
-        assert LABEL_MALICIOUS_CASCADE in _labels_created(c.helper)
+        assert LABEL_INHERITED_MALICIOUS_CASCADE in _labels_created(c.helper)
 
     def test_no_revocation_when_parent_still_malicious(self):
         """
@@ -1754,6 +1840,7 @@ class TestAlreadyClustered:
         # Parent remains CONFIRMED_MALICIOUS
         parent = _obs(entity_id="cidr-001", value="1.2.3.0/24", score=85)
         _wire(c, child, parent)
+        c.helper.api.stix_core_relationship.list.return_value = [_trust_rel(parent)]
 
         c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
 
@@ -1784,7 +1871,7 @@ class TestAlreadyClustered:
 
         assert c.helper.log_warning.called
         warning_text = str(c.helper.log_warning.call_args)
-        assert "orphaned" in warning_text or "no longer exists" in warning_text
+        assert "stale cluster label" in warning_text or "not found" in warning_text
 
     def test_x509_already_clustered_uses_x509_type_not_domain_name(self):
         """
@@ -1816,10 +1903,11 @@ class TestAlreadyClustered:
             return [ca_parent] if "X509-Certificate" in types_arg else []
         c.helper.api.stix_cyber_observable.list.side_effect = _typed_list
         c.helper.api.stix_cyber_observable.read.return_value = child
+        c.helper.api.stix_core_relationship.list.return_value = [_trust_rel(ca_parent)]
 
         result = c.process_message({"entity_id": "obs-001", "entity_type": "X509-Certificate"})
 
-        assert LABEL_MALICIOUS_CASCADE in _labels_created(c.helper), (
+        assert LABEL_INHERITED_MALICIOUS_CASCADE in _labels_created(c.helper), (
             "malicious CA must cascade to already-clustered child cert "
             "(previously silently skipped due to wrong parent type lookup)"
         )
@@ -1836,6 +1924,7 @@ class TestAlreadyClustered:
         parent = _obs(entity_id="ns-001", entity_type="Domain-Name",
                       value="ns1.bulletproof.ru", score=50)
         _wire(c, child, parent)
+        c.helper.api.stix_core_relationship.list.return_value = [_trust_rel(parent)]
 
         c.process_message({"entity_id": "obs-001", "entity_type": "Domain-Name"})
 
@@ -1857,6 +1946,7 @@ class TestAlreadyClustered:
         # Parent score has since been reset to UNKNOWN (50)
         parent = _obs(entity_id="cidr-001", value="1.2.3.0/24", score=50)
         _wire(c, child, parent)
+        c.helper.api.stix_core_relationship.list.return_value = [_trust_rel(parent)]
 
         c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
 
@@ -1879,6 +1969,7 @@ class TestAlreadyClustered:
         )
         parent = _obs(entity_id="cidr-001", value="1.2.3.0/24", score=50)  # UNKNOWN
         _wire(c, child, parent)
+        c.helper.api.stix_core_relationship.list.return_value = [_trust_rel(parent)]
 
         c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
         c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
@@ -1910,6 +2001,401 @@ class TestAlreadyClustered:
             if "conflict" in (call.kwargs.get("abstract") or "").lower()
         ]
         assert len(conflict_notes) == 1   # deduplicated by session set
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Relationship-source-of-truth (TC3)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestRelationshipSourceOfTruth:
+
+    @pytest.mark.parametrize("parents", [
+        [
+            _obs(entity_id="benign", entity_type="Domain-Name", value="good.example", score=20, labels=[LABEL_FP_CANDIDATE]),
+            _obs(entity_id="bad", entity_type="Domain-Name", value="evil.example", score=85),
+        ],
+        [
+            _obs(entity_id="bad", entity_type="Domain-Name", value="evil.example", score=85),
+            _obs(entity_id="benign", entity_type="Domain-Name", value="good.example", score=20, labels=[LABEL_FP_CANDIDATE]),
+        ],
+    ])
+    def test_multi_parent_malicious_wins_order_independent(self, parents):
+        c = _make_connector()
+        child = _obs(entity_type="Domain-Name", value="host.example", score=30)
+        c.helper.api.stix_cyber_observable.read.return_value = child
+        c.helper.api.stix_core_relationship.list.return_value = [_trust_rel(p) for p in parents]
+
+        result = c.process_message({"entity_id": "obs-001", "entity_type": "Domain-Name"})
+
+        labels = _labels_created(c.helper)
+        assert LABEL_INHERITED_MALICIOUS_CASCADE in labels
+        assert LABEL_FP_CANDIDATE not in labels
+        assert "malicious-cascade" in result
+
+    @pytest.mark.parametrize("parents", [
+        [
+            _obs(entity_id="unknown", entity_type="Domain-Name", value="maybe.example", score=50),
+            _obs(entity_id="benign", entity_type="Domain-Name", value="good.example", score=20, labels=[LABEL_FP_CANDIDATE]),
+        ],
+        [
+            _obs(entity_id="benign", entity_type="Domain-Name", value="good.example", score=20, labels=[LABEL_FP_CANDIDATE]),
+            _obs(entity_id="unknown", entity_type="Domain-Name", value="maybe.example", score=50),
+        ],
+    ])
+    def test_multi_parent_unknown_blocks_benign_order_independent(self, parents):
+        c = _make_connector()
+        child = _obs(entity_type="Domain-Name", value="host.example", score=30)
+        c.helper.api.stix_cyber_observable.read.return_value = child
+        c.helper.api.stix_core_relationship.list.return_value = [_trust_rel(p) for p in parents]
+
+        result = c.process_message({"entity_id": "obs-001", "entity_type": "Domain-Name"})
+
+        labels = _labels_created(c.helper)
+        assert LABEL_MALICIOUS_CASCADE not in labels
+        assert LABEL_FP_CANDIDATE not in labels
+        assert "inherited" not in result
+
+    def test_multi_parent_all_benign_inherits_fp_candidate(self):
+        c = _make_connector()
+        child = _obs(entity_type="Domain-Name", value="host.example", score=30)
+        parents = [
+            _obs(entity_id="b1", entity_type="Domain-Name", value="good1.example", score=20, labels=[LABEL_FP_CANDIDATE]),
+            _obs(entity_id="b2", entity_type="Domain-Name", value="good2.example", score=10, labels=[LABEL_FP_CANDIDATE]),
+        ]
+        c.helper.api.stix_cyber_observable.read.return_value = child
+        c.helper.api.stix_core_relationship.list.return_value = [_trust_rel(p) for p in parents]
+
+        result = c.process_message({"entity_id": "obs-001", "entity_type": "Domain-Name"})
+
+        assert LABEL_INHERITED_FP_CANDIDATE in _labels_created(c.helper)
+        assert "fp-candidate inherited" in result
+
+    def test_relationship_parent_lookup_requests_all_pages(self):
+        c = _make_connector()
+        child = _obs(value="1.2.3.4", score=50, labels=[])
+        parent = _obs(entity_id="cidr-001", value="1.2.3.0/24", score=85)
+        _wire(c, child, parent)
+        c.helper.api.stix_core_relationship.list.return_value = [_trust_rel(parent)]
+
+        c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
+
+        c.helper.api.stix_core_relationship.list.assert_any_call(
+            fromId="obs-001", relationship_type="related-to", getAll=True
+        )
+
+    def test_existing_relationship_reads_parent_when_edge_payload_is_partial(self):
+        c = _make_connector()
+        child = _obs(value="1.2.3.4", score=50, labels=[])
+        partial_parent = {
+            "id": "cidr-001",
+            "entity_type": "IPv4-Addr",
+            "observable_value": "1.2.3.0/24",
+        }
+        full_parent = _obs(entity_id="cidr-001", value="1.2.3.0/24", score=85)
+        c.helper.api.stix_cyber_observable.read.side_effect = (
+            lambda id: child if id == "obs-001" else full_parent
+        )
+        c.helper.api.stix_core_relationship.list.return_value = [_trust_rel(partial_parent)]
+
+        result = c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
+
+        c.helper.api.stix_cyber_observable.read.assert_any_call(id="cidr-001")
+        assert LABEL_INHERITED_MALICIOUS_CASCADE in _labels_created(c.helper)
+        assert "malicious-cascade from IPv4-Addr:1.2.3.0/24" in result
+
+    def test_existing_relationship_missing_label_repairs_label_no_duplicate_rel(self):
+        c = _make_connector()
+        child = _obs(value="1.2.3.4", score=50, labels=[])
+        parent = _obs(entity_id="cidr-001", value="1.2.3.0/24", score=85)
+        _wire(c, child, parent)
+        c.helper.api.stix_core_relationship.list.return_value = [_trust_rel(parent)]
+
+        result = c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
+
+        c.helper.api.stix_core_relationship.create.assert_not_called()
+        labels = _labels_created(c.helper)
+        assert f"{CLUSTER_LABEL_PREFIX}:1.2.3.0/24" in labels
+        assert LABEL_INHERITED_MALICIOUS_CASCADE in labels
+        assert "repaired cluster label" in result
+
+    def test_existing_relationship_skips_parent_extraction(self):
+        c = _make_connector({"TRUST_CLUSTER_USE_RDAP": "true"})
+        c._get_announced_cidr = MagicMock(return_value="9.9.9.0/24")
+        child = _obs(value="1.2.3.4", score=50, labels=[])
+        parent = _obs(entity_id="cidr-001", value="1.2.3.0/24", score=50)
+        _wire(c, child, parent)
+        c.helper.api.stix_core_relationship.list.return_value = [_trust_rel(parent)]
+
+        c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
+
+        c._get_announced_cidr.assert_not_called()
+        c.helper.api.stix_cyber_observable.create.assert_not_called()
+
+    def test_stale_label_existing_parent_recreates_relationship(self):
+        c = _make_connector()
+        cluster_lbl = f"{CLUSTER_LABEL_PREFIX}:1.2.3.0/24"
+        child = _obs(value="1.2.3.4", score=50, labels=[cluster_lbl])
+        parent = _obs(entity_id="cidr-001", value="1.2.3.0/24", score=50)
+        _wire(c, child, parent)
+        c.helper.api.stix_core_relationship.list.return_value = []
+
+        c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
+
+        c.helper.api.stix_core_relationship.create.assert_called_once_with(
+            fromId="obs-001", toId="cidr-001",
+            relationship_type="related-to",
+            description="IOC trust-cluster structural parent link (auto-created)",
+            confidence=75,
+        )
+        child_label_adds = [
+            call for call in c.helper.api.stix_cyber_observable.add_label.call_args_list
+            if call.kwargs.get("id") == "obs-001"
+        ]
+        assert not child_label_adds  # child label already present
+
+    def test_stale_label_missing_parent_warns_no_crash(self):
+        c = _make_connector()
+        child = _obs(
+            value="1.2.3.4", score=50,
+            labels=[f"{CLUSTER_LABEL_PREFIX}:1.2.3.0/24"],
+        )
+        c.helper.api.stix_cyber_observable.read.return_value = child
+        c.helper.api.stix_core_relationship.list.return_value = []
+        c.helper.api.stix_cyber_observable.list.return_value = []
+
+        result = c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
+
+        assert "no actions" in result
+        c.helper.api.stix_core_relationship.create.assert_not_called()
+        assert c.helper.log_warning.called
+        assert "stale cluster label" in str(c.helper.log_warning.call_args)
+
+    def test_stale_x509_issuer_dn_label_does_not_recreate_relationship(self):
+        c = _make_connector()
+        cluster_lbl = f"{CLUSTER_LABEL_PREFIX}:CN=Root CA,O=Corp"
+        child = _obs(
+            entity_type="X509-Certificate", value="CN=leaf.corp.com",
+            score=50, labels=[cluster_lbl],
+            issuer="CN=Root CA,O=Corp", subject="CN=leaf.corp.com",
+        )
+        c.helper.api.stix_cyber_observable.read.return_value = child
+        c.helper.api.stix_core_relationship.list.return_value = []
+
+        c.process_message({"entity_id": "obs-001", "entity_type": "X509-Certificate"})
+
+        c.helper.api.stix_core_relationship.create.assert_not_called()
+        c.helper.api.stix_cyber_observable.create.assert_not_called()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Connector-owned inherited state retraction (580)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestInheritedStateRetraction:
+
+    def test_unknown_parent_removes_only_namespaced_malicious_state(self):
+        c = _make_connector()
+        child = _obs(
+            value="1.2.3.4", score=50,
+            labels=[LABEL_INHERITED_MALICIOUS_CASCADE, LABEL_MALICIOUS_CASCADE],
+        )
+        parent = _obs(entity_id="cidr-001", value="1.2.3.0/24", score=50)
+        c.helper.api.stix_cyber_observable.read.return_value = child
+        c.helper.api.stix_core_relationship.list.return_value = [_trust_rel(parent)]
+
+        result = c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
+
+        c.helper.api.stix_cyber_observable.remove_label.assert_called_once_with(
+            id="obs-001", label_id="label-0"
+        )
+        assert "removed unsupported inherited malicious state" in result
+
+    def test_unknown_parent_removes_only_namespaced_fp_state(self):
+        c = _make_connector()
+        child = _obs(
+            entity_type="Domain-Name", value="host.example", score=30,
+            labels=[LABEL_INHERITED_FP_CANDIDATE, LABEL_FP_CANDIDATE],
+        )
+        parent = _obs(entity_id="parent", entity_type="Domain-Name", value="example", score=50)
+        c.helper.api.stix_cyber_observable.read.return_value = child
+        c.helper.api.stix_core_relationship.list.return_value = [_trust_rel(parent)]
+
+        result = c.process_message({"entity_id": "obs-001", "entity_type": "Domain-Name"})
+
+        c.helper.api.stix_cyber_observable.remove_label.assert_called_once_with(
+            id="obs-001", label_id="label-0"
+        )
+        assert "removed unsupported inherited fp state" in result
+
+    def test_mixed_parent_removes_fp_and_adds_malicious_state(self):
+        c = _make_connector()
+        child = _obs(
+            entity_type="Domain-Name", value="host.example", score=30,
+            labels=[LABEL_INHERITED_FP_CANDIDATE],
+        )
+        parents = [
+            _obs(entity_id="good", entity_type="Domain-Name", value="good.example", score=20, labels=[LABEL_FP_CANDIDATE]),
+            _obs(entity_id="bad", entity_type="Domain-Name", value="bad.example", score=85),
+        ]
+        c.helper.api.stix_cyber_observable.read.return_value = child
+        c.helper.api.stix_core_relationship.list.return_value = [_trust_rel(p) for p in parents]
+
+        result = c.process_message({"entity_id": "obs-001", "entity_type": "Domain-Name"})
+
+        assert LABEL_INHERITED_MALICIOUS_CASCADE in _labels_created(c.helper)
+        c.helper.api.stix_cyber_observable.remove_label.assert_called_once_with(
+            id="obs-001", label_id="label-0"
+        )
+        assert "removed unsupported inherited fp state" in result
+
+    def test_benign_parent_keeps_supported_inherited_fp_state(self):
+        c = _make_connector()
+        child = _obs(
+            entity_type="Domain-Name", value="host.example", score=30,
+            labels=[LABEL_INHERITED_FP_CANDIDATE],
+        )
+        parent = _obs(entity_id="good", entity_type="Domain-Name", value="good.example", score=20, labels=[LABEL_FP_CANDIDATE])
+        c.helper.api.stix_cyber_observable.read.return_value = child
+        c.helper.api.stix_core_relationship.list.return_value = [_trust_rel(parent)]
+
+        c.process_message({"entity_id": "obs-001", "entity_type": "Domain-Name"})
+
+        c.helper.api.stix_cyber_observable.remove_label.assert_not_called()
+
+    def test_remove_label_failure_logs_warning_and_leaves_prior_state(self):
+        c = _make_connector()
+        child = _obs(value="1.2.3.4", score=50, labels=[LABEL_INHERITED_MALICIOUS_CASCADE])
+        parent = _obs(entity_id="cidr-001", value="1.2.3.0/24", score=50)
+        c.helper.api.stix_cyber_observable.read.return_value = child
+        c.helper.api.stix_core_relationship.list.return_value = [_trust_rel(parent)]
+        c.helper.api.stix_cyber_observable.remove_label.side_effect = RuntimeError("boom")
+
+        result = c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
+
+        assert "removed unsupported" not in result
+        assert c.helper.log_warning.called
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Parent-triggered fanout (TC2)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestParentFanout:
+
+    @staticmethod
+    def _rels_for(parent_id: str, *rels):
+        def _list(*args, **kwargs):
+            if kwargs.get("toId") == parent_id:
+                return list(rels)
+            return []
+        return _list
+
+    def test_parent_malicious_fanout_labels_direct_child(self):
+        c = _make_connector()
+        parent = _obs(entity_id="cidr-001", value="1.2.3.0/24", score=85)
+        child = _obs(entity_id="child-1", value="1.2.3.4", score=50)
+        c.helper.api.stix_cyber_observable.read.return_value = parent
+        c.helper.api.stix_core_relationship.list.side_effect = self._rels_for(
+            "cidr-001", _child_rel(child)
+        )
+
+        result = c.process_message({"entity_id": "cidr-001", "entity_type": "IPv4-Addr"})
+
+        assert LABEL_INHERITED_MALICIOUS_CASCADE in _labels_created(c.helper)
+        c.helper.api.stix_cyber_observable.add_label.assert_called_with(
+            id="child-1", label_id="label-id-stub"
+        )
+        assert "malicious-cascade" in result
+
+    def test_parent_benign_fanout_labels_eligible_child(self):
+        c = _make_connector()
+        parent = _obs(
+            entity_id="cidr-001", value="1.2.3.0/24", score=20,
+            labels=[LABEL_FP_CANDIDATE],
+        )
+        child = _obs(entity_id="child-1", value="1.2.3.4", score=50)
+        c.helper.api.stix_cyber_observable.read.return_value = parent
+        c.helper.api.stix_core_relationship.list.side_effect = self._rels_for(
+            "cidr-001", _child_rel(child)
+        )
+
+        result = c.process_message({"entity_id": "cidr-001", "entity_type": "IPv4-Addr"})
+
+        assert LABEL_INHERITED_FP_CANDIDATE in _labels_created(c.helper)
+        assert "fp-candidate inherited" in result
+
+    def test_parent_unknown_fanout_creates_revocation_note_for_cascaded_child(self):
+        c = _make_connector()
+        parent = _obs(entity_id="cidr-001", value="1.2.3.0/24", score=50)
+        child = _obs(
+            entity_id="child-1", value="1.2.3.4", score=50,
+            labels=[LABEL_MALICIOUS_CASCADE],
+        )
+        c.helper.api.stix_cyber_observable.read.return_value = parent
+        c.helper.api.stix_core_relationship.list.side_effect = self._rels_for(
+            "cidr-001", _child_rel(child)
+        )
+
+        result = c.process_message({"entity_id": "cidr-001", "entity_type": "IPv4-Addr"})
+
+        revocation_notes = [
+            call for call in c.helper.api.note.create.call_args_list
+            if "cascade revocation" in (call.kwargs.get("abstract") or "")
+        ]
+        assert len(revocation_notes) == 1
+        assert "cascade-revocation" in result
+
+    def test_parent_fanout_second_run_is_noop_when_label_already_present(self):
+        c = _make_connector()
+        parent = _obs(entity_id="cidr-001", value="1.2.3.0/24", score=85)
+        child = _obs(
+            entity_id="child-1", value="1.2.3.4", score=50,
+            labels=[LABEL_MALICIOUS_CASCADE],
+        )
+        c.helper.api.stix_cyber_observable.read.return_value = parent
+        c.helper.api.stix_core_relationship.list.side_effect = self._rels_for(
+            "cidr-001", _child_rel(child)
+        )
+
+        result = c.process_message({"entity_id": "cidr-001", "entity_type": "IPv4-Addr"})
+
+        assert LABEL_MALICIOUS_CASCADE not in _labels_created(c.helper)
+        assert "no actions" in result
+
+    def test_parent_fanout_requests_all_pages_and_uses_late_child(self):
+        c = _make_connector()
+        parent = _obs(entity_id="cidr-001", value="1.2.3.0/24", score=85)
+        child = _obs(entity_id="child-late", value="1.2.3.200", score=50)
+        c.helper.api.stix_cyber_observable.read.return_value = parent
+        c.helper.api.stix_core_relationship.list.side_effect = self._rels_for(
+            "cidr-001",
+            *[{"description": "manual analyst link", "from": _obs(entity_id=f"m{i}")} for i in range(100)],
+            _child_rel(child),
+        )
+
+        c.process_message({"entity_id": "cidr-001", "entity_type": "IPv4-Addr"})
+
+        c.helper.api.stix_core_relationship.list.assert_any_call(
+            toId="cidr-001", relationship_type="related-to", getAll=True
+        )
+        assert LABEL_INHERITED_MALICIOUS_CASCADE in _labels_created(c.helper)
+        c.helper.api.stix_cyber_observable.add_label.assert_called_with(
+            id="child-late", label_id="label-id-stub"
+        )
+
+    def test_parent_fanout_ignores_non_connector_relationships(self):
+        c = _make_connector()
+        parent = _obs(entity_id="cidr-001", value="1.2.3.0/24", score=85)
+        child = _obs(entity_id="child-1", value="1.2.3.4", score=50)
+        c.helper.api.stix_cyber_observable.read.return_value = parent
+        c.helper.api.stix_core_relationship.list.side_effect = self._rels_for(
+            "cidr-001", {"description": "manual analyst link", "from": child}
+        )
+
+        result = c.process_message({"entity_id": "cidr-001", "entity_type": "IPv4-Addr"})
+
+        assert LABEL_MALICIOUS_CASCADE not in _labels_created(c.helper)
+        assert "no actions" in result
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2066,7 +2552,7 @@ class TestSinkhole:
 
         c.process_message({"entity_id": "obs-001", "entity_type": "Domain-Name"})
 
-        assert LABEL_MALICIOUS_CASCADE in _labels_created(c.helper)
+        assert LABEL_INHERITED_MALICIOUS_CASCADE in _labels_created(c.helper)
 
     def test_sinkholed_parent_cascade_color_is_red(self):
         c = _make_connector({"TRUST_CLUSTER_USE_NS_LOOKUP": "false"})
@@ -2077,7 +2563,7 @@ class TestSinkhole:
         c.process_message({"entity_id": "obs-001", "entity_type": "Domain-Name"})
 
         calls = [cl for cl in c.helper.api.label.create.call_args_list
-                 if (cl.kwargs.get("value") or "") == LABEL_MALICIOUS_CASCADE]
+                 if (cl.kwargs.get("value") or "") == LABEL_INHERITED_MALICIOUS_CASCADE]
         assert calls[0].kwargs["color"] == COLOR_MALICIOUS
 
 
@@ -2158,6 +2644,23 @@ class TestSightingSourceFilter:
         c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
 
         assert LABEL_FP_CANDIDATE not in _labels_created(c.helper)
+
+    def test_filtered_sightings_after_first_page_are_counted(self):
+        c = _make_connector({
+            "TRUST_CLUSTER_SIGHTING_SOURCE_FILTER": "connector-SIEM",
+            "TRUST_CLUSTER_FP_SIGHTING_THRESHOLD": "3",
+        })
+        child = _obs(value="8.8.4.4", score=30)
+        _wire(c, child)
+        c.helper.api.stix_sighting_relationship.list.return_value = \
+            self._sightings(["connector-OTX"] * 100 + ["connector-SIEM"] * 3)
+
+        c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
+
+        c.helper.api.stix_sighting_relationship.list.assert_called_with(
+            toId="obs-001", getAll=True
+        )
+        assert LABEL_FP_CANDIDATE in _labels_created(c.helper)
 
     def test_multi_connector_filter_all_sources_count(self):
         """Multiple connectors in the filter: sightings from any of them count."""
@@ -2369,6 +2872,7 @@ class TestStats:
         child = _obs(value="1.2.3.4", score=50, labels=[cluster_lbl])
         parent = _obs(entity_id="cidr-001", value="1.2.3.0/24", score=50)
         _wire(c, child, parent)
+        c.helper.api.stix_core_relationship.list.return_value = [_trust_rel(parent)]
         c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
         assert "already_clustered=1" in self._stats_lines(c)[0]
 
@@ -2394,6 +2898,7 @@ class TestStats:
         # Parent score has been reset to UNKNOWN
         parent = _obs(entity_id="cidr-001", value="1.2.3.0/24", score=50)
         _wire(c, child, parent)
+        c.helper.api.stix_core_relationship.list.return_value = [_trust_rel(parent)]
         c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
         assert "cascade_revoked=1" in self._stats_lines(c)[0]
 
