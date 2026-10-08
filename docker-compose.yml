@@ -311,7 +311,10 @@ services:
 
   connector-abuseipdb:
     build:
-      context: ./connectors/abuseipdb-cidr-filter
+      context: ./connectors/cidr-enrichment-filter
+      args:
+        BASE_IMAGE: opencti/connector-abuseipdb:latest
+        CIDR_FILTER_CONNECTOR: abuseipdb
     image: local/connector-abuseipdb-cidr-filter:latest
     environment:
       - OPENCTI_URL=http://opencti:8080
@@ -331,7 +334,10 @@ services:
 
   connector-ipqs:
     build:
-      context: ./connectors/ipqs-cidr-filter
+      context: ./connectors/cidr-enrichment-filter
+      args:
+        BASE_IMAGE: opencti/connector-ipqs:latest
+        CIDR_FILTER_CONNECTOR: ipqs
     image: local/connector-ipqs-cidr-filter:latest
     environment:
       - OPENCTI_URL=http://opencti:8080
@@ -374,7 +380,10 @@ services:
 
   connector-virustotal:
     build:
-      context: ./connectors/virustotal-cidr-filter
+      context: ./connectors/cidr-enrichment-filter
+      args:
+        BASE_IMAGE: opencti/connector-virustotal:latest
+        CIDR_FILTER_CONNECTOR: virustotal
     image: local/connector-virustotal-cidr-filter:latest
     environment:
       - OPENCTI_URL=http://opencti:8080
