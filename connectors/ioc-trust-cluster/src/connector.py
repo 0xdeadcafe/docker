@@ -27,8 +27,9 @@ Autonomous-System   RDAP ASN owner name        label-only     ubiquity only
 Relationship trust vs label-only grouping
 ─────────────────────────────────────────
 relationship A parent StixCyberObservable is found-or-created.  A "related-to"
-trust        relationship links child → parent.  The parent's score and labels
-             drive full verdict cascade (CONFIRMED_MALICIOUS / CONFIRMED_BENIGN).
+trust        relationship links child → parent.  CIDR parents also link to AS
+             observables with "belongs-to" when RDAP returns ASN metadata.
+             Parent scores and labels drive verdict cascade.
 
 label-only   No OpenCTI observable type exists for the grouping concept (e.g. TLS
  grouping    profile, ASN owner organisation).  A cluster label is applied
@@ -45,7 +46,7 @@ CONFIRMED_MALICIOUS  parent.score ≥ MALICIOUS_SCORE_MIN
                      → cascade DOWN: child gets connector-owned
                        "trust-cluster:malicious-cascade"
 
-CONFIRMED_BENIGN     parent carries "fp-candidate"
+CONFIRMED_BENIGN     parent carries "fp-confirmed"
                      AND parent is not CONFIRMED_MALICIOUS
                      → propagate DOWN to children with score ≤
                        TRUST_CLUSTER_FP_CASCADE_SCORE_MAX (default:
@@ -63,7 +64,7 @@ Pipeline (per observable)
   Step 1  Structural parent discovery
   Step 2  Parent upsert (observable mode: find-or-create; label mode: skip)
   Step 3  Trust relationship (observable mode only: child → parent "related-to")
-  Step 4  Cluster label (both modes: shared label on child; parent if observable)
+  Step 4  CIDR ownership relationship when available (CIDR → AS "belongs-to")
   Step 5  Verdict inheritance (observable mode only; UNKNOWN parent stops)
   Step 6  Ubiquity heuristic (all types)
   Step 7  Audit note
@@ -92,7 +93,8 @@ _tld = tldextract.TLDExtract(suffix_list_urls=None)
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-LABEL_FP_CANDIDATE      = "fp-candidate"          # direct/analyst/feed benign signal
+LABEL_FP_CANDIDATE      = "fp-candidate"          # heuristic/candidate benign signal
+LABEL_FP_CONFIRMED      = "fp-confirmed"          # explicit benign signal allowed to cascade
 LABEL_MALICIOUS_CASCADE = "malicious-cascade"     # legacy/manual malicious state
 LABEL_SINKHOLED         = "sinkholed"
 CLUSTER_LABEL_PREFIX    = "trust-cluster"
@@ -100,6 +102,7 @@ LABEL_INHERITED_FP_CANDIDATE      = f"{CLUSTER_LABEL_PREFIX}:fp-candidate"
 LABEL_INHERITED_MALICIOUS_CASCADE = f"{CLUSTER_LABEL_PREFIX}:malicious-cascade"
 INHERITED_STATE_LABELS = {LABEL_INHERITED_FP_CANDIDATE, LABEL_INHERITED_MALICIOUS_CASCADE}
 TRUST_REL_DESCRIPTION   = "IOC trust-cluster structural parent link (auto-created)"
+ASN_REL_DESCRIPTION     = "IOC trust-cluster CIDR to ASN ownership link (auto-created)"
 
 COLOR_CLUSTER   = "#1565c0"   # blue   — structural grouping
 COLOR_FP        = "#2e7d32"   # green  — likely benign / FP candidate
@@ -201,6 +204,7 @@ class IocTrustClusterConnector:
 
         # Session caches — avoid redundant network calls for the same address / domain
         self._cidr_cache: dict[str, str | None] = {}   # ip_str → CIDR string
+        self._cidr_asn_cache: dict[str, tuple[str, str | None]] = {}  # CIDR → (ASN, owner)
         self._asn_desc_cache: dict[str, str | None] = {}  # "AS{n}" → owner name
         self._ns_cache: dict[str, str | None] = {}     # domain → primary NS hostname
         self._ip_cache: dict[str, list[str]] = {}      # domain → A record IP list
@@ -329,6 +333,8 @@ class IocTrustClusterConnector:
                 best = max(candidates, key=lambda net: net.prefixlen)
                 normalised = str(best)
                 self._cache_set(self._cidr_cache, ip_str, normalised)
+                if asn:
+                    self._cache_set(self._cidr_asn_cache, normalised, (str(asn), asn_desc or None))
                 self.helper.log_debug(
                     f"[trust-cluster] RDAP {ip_str} → {normalised} "
                     f"(ASN{asn} {asn_desc})"
@@ -614,7 +620,7 @@ class IocTrustClusterConnector:
             malicious.  Only then can the parent cascade DOWN to its children.
 
         CONFIRMED_BENIGN
-            Parent carries "fp-candidate" AND is not CONFIRMED_MALICIOUS.
+            Parent carries "fp-confirmed" AND is not CONFIRMED_MALICIOUS.
 
         UNKNOWN
             Everything else — no direct feed assessment, OR the parent carries
@@ -625,7 +631,7 @@ class IocTrustClusterConnector:
             return "CONFIRMED_MALICIOUS"
         if p_score >= self.malicious_score_min and not self._has_malicious_cascade_label(p_labels):
             return "CONFIRMED_MALICIOUS"
-        if self._has_fp_candidate_label(p_labels) and p_score < self.malicious_score_min:
+        if LABEL_FP_CONFIRMED in p_labels and p_score < self.malicious_score_min:
             return "CONFIRMED_BENIGN"
         return "UNKNOWN"
 
@@ -899,23 +905,29 @@ class IocTrustClusterConnector:
             )
             return None
 
-    def _ensure_relationship(self, child_id: str, parent_id: str) -> bool:
+    def _ensure_core_relationship(
+        self,
+        from_id: str,
+        to_id: str,
+        relationship_type: str,
+        description: str,
+    ) -> bool:
         try:
             rels = self.helper.api.stix_core_relationship.list(
-                fromId=child_id,
-                relationship_type="related-to",
+                fromId=from_id,
+                relationship_type=relationship_type,
                 getAll=True,
             ) or []
             for rel in rels:
-                if TRUST_REL_DESCRIPTION not in (rel.get("description") or ""):
+                if description not in (rel.get("description") or ""):
                     continue
-                to_id = rel.get("toId") or (rel.get("to") or {}).get("id")
-                if to_id == parent_id:
+                rel_to_id = rel.get("toId") or (rel.get("to") or {}).get("id")
+                if rel_to_id == to_id:
                     return True
             self.helper.api.stix_core_relationship.create(
-                fromId=child_id, toId=parent_id,
-                relationship_type="related-to",
-                description=TRUST_REL_DESCRIPTION,
+                fromId=from_id, toId=to_id,
+                relationship_type=relationship_type,
+                description=description,
                 confidence=self.confidence,
             )
             return True
@@ -924,6 +936,46 @@ class IocTrustClusterConnector:
                 f"[trust-cluster] relationship create failed: {e}"
             )
             return False
+
+    def _ensure_relationship(self, child_id: str, parent_id: str) -> bool:
+        return self._ensure_core_relationship(
+            child_id, parent_id, "related-to", TRUST_REL_DESCRIPTION
+        )
+
+    def _find_or_create_asn(self, asn: str, owner: str | None) -> dict | None:
+        digits = re.sub(r"[^0-9]", "", str(asn))
+        if not digits:
+            return None
+        try:
+            results = self.helper.api.stix_cyber_observable.list(
+                types=["Autonomous-System"],
+                filters={"mode": "and", "filters": [{"key": "number", "values": [digits]}], "filterGroups": []},
+                first=1,
+            ) or []
+            if results:
+                return results[0]
+            return self.helper.api.stix_cyber_observable.create(
+                observableData={
+                    "type": "autonomous-system",
+                    "number": int(digits),
+                    "name": owner or f"AS{digits}",
+                }
+            )
+        except Exception as e:
+            self.helper.log_warning(f"[trust-cluster] ASN upsert failed AS{digits}: {e}")
+            return None
+
+    def _ensure_cidr_asn_relationship(self, cidr_parent: dict, cidr_value: str) -> bool:
+        asn_info = self._cidr_asn_cache.get(cidr_value)
+        if not asn_info:
+            return False
+        asn, owner = asn_info
+        asn_obs = self._find_or_create_asn(asn, owner)
+        if not asn_obs:
+            return False
+        return self._ensure_core_relationship(
+            cidr_parent["id"], asn_obs["id"], "belongs-to", ASN_REL_DESCRIPTION
+        )
 
     def _get_sightings_count(self, entity_id: str) -> int:
         try:
@@ -1143,11 +1195,9 @@ class IocTrustClusterConnector:
         )
 
         # ── Structural parent path ──────────────────────────────────────────────
-        # If the observable already carries a trust-cluster label the structural
-        # link (relationship + cluster label) was created on a previous run.
-        # Skip _extract_parent entirely — no redundant DNS/RDAP lookups.
-        # For verdict cascade, look up the known parent directly from the label
-        # so score changes on the parent still propagate on the next trigger.
+        # Relationships are the source of truth. Legacy trust-cluster:<parent>
+        # labels are read only as a backcompat repair hint for old objects that
+        # have the label but are missing the connector-created relationship.
         existing_cluster = next(
             (
                 lbl for lbl in labels
@@ -1197,11 +1247,9 @@ class IocTrustClusterConnector:
             # ── Observable parent path ────────────────────────────────────────────────
             # IPv4/IPv6 network, Domain-Name root/NS, X509 CA cert.
             elif p_value != value:
-                cluster_lbl = f"{CLUSTER_LABEL_PREFIX}:{p_value}"
-
-                # Already clustered + already cascaded: no-op, skip parent lookup.
-                # Already clustered, no verdict yet: re-check parent score only.
-                # First time: full pipeline (create parent, link, label, verdict).
+                # Existing relationship: re-check parent score only.
+                # Legacy label: repair/recreate the missing relationship.
+                # First time: create/reuse parent, link, then inherit verdict.
                 if relationship_parent is not None:
                     parent = relationship_parent
                 elif already_clustered:
@@ -1226,24 +1274,16 @@ class IocTrustClusterConnector:
                     p_score  = relationship_score if relationship_score is not None else self._entity_score(parent)
                     p_labels = self._entity_label_values(parent)
 
-                    if not already_clustered:
-                        # Step 3: trust relationship child → parent (never reversed)
-                        rel_ok = self._ensure_relationship(entity_id, p_id)
+                    if p_type in {"IPv4-Addr", "IPv6-Addr"} and "/" in p_value:
+                        if self._ensure_cidr_asn_relationship(parent, p_value):
+                            actions.append(f"linked {p_type}:{p_value} to ASN")
 
-                        # Step 4: shared cluster label on both child and parent
-                        lbl_ok = True
-                        if cluster_lbl not in labels:
-                            lbl_ok = self._add_label(entity_id, cluster_lbl, COLOR_CLUSTER)
-                            if lbl_ok:
-                                labels.add(cluster_lbl)
-                        self._add_label(p_id, cluster_lbl, COLOR_CLUSTER)  # parent: best-effort
-                        if rel_ok and lbl_ok:
-                            actions.append(f"clustered under {p_type}:{p_value}")
-                    elif cluster_lbl not in labels:
-                        if self._add_label(entity_id, cluster_lbl, COLOR_CLUSTER):
-                            labels.add(cluster_lbl)
-                            actions.append(f"repaired cluster label for {p_type}:{p_value}")
-                        self._add_label(p_id, cluster_lbl, COLOR_CLUSTER)  # parent: best-effort
+                    if not already_clustered:
+                        # Step 3: trust relationship child → parent (never reversed).
+                        # No structural trust labels: parentage/trust is graph-only.
+                        if self._ensure_relationship(entity_id, p_id):
+                            action = "repaired relationship to" if stale_cluster else "linked under"
+                            actions.append(f"{action} {p_type}:{p_value}")
 
                     # Step 5: verdict re-checked every trigger so parent score
                     # changes propagate down to children on their next update.
@@ -1328,7 +1368,7 @@ class IocTrustClusterConnector:
                 if "fp-candidate inherited" in action: self._stats["cascade_fp"]         += 1
                 if "fp-candidate via ubiquity" in action: self._stats["ubiquity_fp"]     += 1
                 if "sinkholed"              in action: self._stats["sinkholed"]          += 1
-                if "clustered under"        in action: self._stats["newly_clustered"]    += 1
+                if "linked under"           in action: self._stats["newly_clustered"]    += 1
                 if "cascade-revocation"     in action: self._stats["cascade_revoked"]   += 1
             if _conflict_this_trigger:             self._stats["cascade_conflict"]    += 1
             if already_clustered:                  self._stats["already_clustered"] += 1

@@ -152,6 +152,16 @@ class TestSqlGeneration:
         bare_refs = _re.findall(r'\borig_bytes\b', sql)
         assert not bare_refs, f"bare orig_bytes found: {bare_refs}"
 
+    def test_isession_breadth_grouped_by_ip_only(self, default_sql_params):
+        """vs1.1: ports/domains/services must not split IP breadth."""
+        q = next(q for q in ALL_QUERIES if q.name == "broad_reach_ips")
+        sql = q.build_sql(**default_sql_params)
+        assert "GROUP BY id.resp_h\n" in sql
+        assert "GROUP BY id.resp_h, resp_domain, id.resp_p, service" not in sql
+        assert "COUNT(DISTINCT resp_domain)" in sql
+        assert "COUNT(DISTINCT id.resp_p)" in sql
+        assert "COUNT(DISTINCT service)" in sql
+
     def test_no_joins_or_ctes(self, default_sql_params):
         for qdef in ALL_QUERIES:
             sql = qdef.build_sql(**default_sql_params).upper()
@@ -183,6 +193,14 @@ class TestSqlGeneration:
         sql = q.build_sql(**default_sql_params)
         assert "REGEXP_LIKE" in sql
         assert "id.resp_h" in sql
+
+    def test_http_normalizes_host_port_before_grouping(self, default_sql_params):
+        """vs1.2: example.com:80 and example.com:8080 share one breadth group."""
+        q = next(q for q in ALL_QUERIES if q.name == "broad_reach_http")
+        sql = q.build_sql(**default_sql_params)
+        assert "REGEXP_REPLACE(host, ':[0-9]+$', '')" in sql
+        assert "GROUP BY CASE" in sql
+        assert "GROUP BY host" not in sql
 
     def test_beacons_filters_private_resp_h(self, default_sql_params):
         q = next(q for q in ALL_QUERIES if q.name == "benign_beacons")
@@ -225,6 +243,15 @@ class TestSqlGeneration:
                 f"BENIGN_BEACON_TYPES entry '{btype}' is missing from the "
                 "Q5 SQL safelist — update the SQL to match the constant"
             )
+
+    def test_beacon_breadth_not_split_by_service_or_beacon_type(self, default_sql_params):
+        """vs1.3: Q5 breadth is per emitted destination, not service/type shard."""
+        q = next(q for q in ALL_QUERIES if q.name == "benign_beacons")
+        sql = q.build_sql(**default_sql_params)
+        assert "GROUP BY resp_domains, id.resp_h" in sql
+        assert "GROUP BY resp_domains, id.resp_h, service, beacon_type" not in sql
+        assert "COUNT(DISTINCT service)" in sql
+        assert "COUNT(DISTINCT beacon_type)" in sql
 
     # ── Concern 5: Q6 invalid column name ──────────────────────────────────────────────
 
@@ -369,6 +396,10 @@ class TestExtractBroadReachHttp:
 
     def test_private_ip_skipped(self, q_http):
         rows = [{"host": "172.16.0.1", "src_host_count": 100}]
+        assert list(q_http.extract_iocs(rows)) == []
+
+    def test_bracketed_ipv6_with_port_skipped(self, q_http):
+        rows = [{"host": "[2001:db8::1]:443", "src_host_count": 100}]
         assert list(q_http.extract_iocs(rows)) == []
 
 
@@ -656,10 +687,10 @@ class TestAddLabel:
 class TestImportIoc:
     """V4, V5: _import_ioc note gating and independent label tracking."""
 
-    def _existing_obs(self, obs_id="obs-1", labels=None):
+    def _existing_obs(self, obs_id="obs-1", labels=None, score=50):
         return {
             "id": obs_id,
-            "x_opencti_score": 50,
+            "x_opencti_score": score,
             "objectLabel": [{"value": lbl} for lbl in (labels or [])],
         }
 
@@ -679,7 +710,7 @@ class TestImportIoc:
         c.helper.api.note.create.assert_not_called()
 
     def test_note_created_exactly_once_on_success(self):
-        """V4: on successful label application, note is created exactly once."""
+        """V4: on successful source-label application, note is created exactly once."""
         c = _make_conn()
         c.helper.api.stix_cyber_observable.list.return_value = []
         c.helper.api.stix_cyber_observable.create.return_value = {"id": "obs-new"}
@@ -691,11 +722,122 @@ class TestImportIoc:
         # Note created only once (dedup via _seen_this_cycle within a cycle)
         assert c.helper.api.note.create.call_count == 1
 
+    def test_default_does_not_apply_fp_candidate(self):
+        """2xp: high-breadth Vectra context is not cascade-capable by default."""
+        c = _make_conn()
+        c.helper.api.stix_cyber_observable.list.return_value = []
+        c.helper.api.stix_cyber_observable.create.return_value = {"id": "obs-new"}
+
+        c._import_ioc(_ioc_entry(), "test query")
+
+        label_calls = [call.kwargs.get("value") for call in c.helper.api.label.create.call_args_list]
+        assert "fp-candidate" not in label_calls
+        assert "vectra-metadata-popular-ip" in label_calls
+        assert "vectra-metadata-benign" not in label_calls
+        assert "breadth:50-99" in label_calls
+
+    def test_default_creates_missing_for_whitelist_mining(self):
+        """05t: default keeps metadata-mining inventory/cache behavior."""
+        c = _make_conn()
+        c.helper.api.stix_cyber_observable.list.return_value = []
+        c.helper.api.stix_cyber_observable.create.return_value = {"id": "obs-new"}
+
+        assert c._import_ioc(_ioc_entry(), "test query") is True
+
+        c.helper.api.stix_cyber_observable.create.assert_called_once()
+
+    def test_create_missing_can_be_disabled(self):
+        """05t: enrichment-only deployments can opt out of benign inventory."""
+        c = _make_conn({"VECTRA_FP_CREATE_MISSING": "false"})
+        c.helper.api.stix_cyber_observable.list.return_value = []
+
+        assert c._import_ioc(_ioc_entry(), "test query") is False
+
+        c.helper.api.stix_cyber_observable.create.assert_not_called()
+        assert c._skipped_missing == 1
+
+    def test_score_zero_existing_observable_not_blocked_by_malicious_guard(self):
+        """V18: score=0 must stay 0, not become fallback 50 via `or 50`."""
+        c = _make_conn({"VECTRA_FP_MALICIOUS_GUARD_SCORE": "1"})
+        c.helper.api.stix_cyber_observable.list.return_value = [
+            self._existing_obs(score=0)
+        ]
+
+        assert c._import_ioc(_ioc_entry(), "test query") is True
+
+        label_calls = [call.kwargs.get("value") for call in c.helper.api.label.create.call_args_list]
+        assert "vectra-metadata-popular-ip" in label_calls
+
+    def test_malicious_guard_still_blocks_high_score_existing_observable(self):
+        c = _make_conn({"VECTRA_FP_MALICIOUS_GUARD_SCORE": "70"})
+        c.helper.api.stix_cyber_observable.list.return_value = [
+            self._existing_obs(score=70)
+        ]
+
+        assert c._import_ioc(_ioc_entry(), "test query") is False
+
+        c.helper.api.label.create.assert_not_called()
+
+    def test_fp_candidate_is_opt_in(self):
+        """2xp: env flag preserves cascade-capable label behavior when requested."""
+        c = _make_conn({"VECTRA_FP_APPLY_FP_CANDIDATE": "true"})
+        c.helper.api.stix_cyber_observable.list.return_value = []
+        c.helper.api.stix_cyber_observable.create.return_value = {"id": "obs-new"}
+
+        c._import_ioc(_ioc_entry(), "test query")
+
+        label_calls = [call.kwargs.get("value") for call in c.helper.api.label.create.call_args_list]
+        assert "fp-candidate" in label_calls
+        assert "vectra-metadata-popular-ip" in label_calls
+        assert "vectra-metadata-benign" not in label_calls
+
+    def test_dns_domain_uses_strong_vectra_benign_label(self):
+        """lo3.1: domain signals stay on the stronger benign path."""
+        c = _make_conn()
+        c.helper.api.stix_cyber_observable.list.return_value = []
+        c.helper.api.stix_cyber_observable.create.return_value = {"id": "obs-new"}
+        entry = _ioc_entry(
+            ioc_type="Domain-Name", value="example.com", query_name="broad_reach_dns"
+        )
+
+        c._import_ioc(entry, "test query")
+
+        label_calls = [call.kwargs.get("value") for call in c.helper.api.label.create.call_args_list]
+        assert "vectra-metadata-benign" in label_calls
+        assert "vectra-metadata-popular-ip" not in label_calls
+
+    def test_strong_raw_ips_env_adds_vectra_benign_to_q1(self):
+        """lo3.1: operators can opt into treating raw IP breadth as strong."""
+        c = _make_conn({"VECTRA_FP_STRONG_RAW_IPS": "true"})
+        c.helper.api.stix_cyber_observable.list.return_value = []
+        c.helper.api.stix_cyber_observable.create.return_value = {"id": "obs-new"}
+
+        c._import_ioc(_ioc_entry(), "test query")
+
+        label_calls = [call.kwargs.get("value") for call in c.helper.api.label.create.call_args_list]
+        assert "vectra-metadata-popular-ip" in label_calls
+        assert "vectra-metadata-benign" in label_calls
+
+    def test_m365_shared_auth_ip_uses_strong_vectra_benign_label(self):
+        """lo3.1: M365 egress/proxy IPs stay on the stronger benign path."""
+        c = _make_conn()
+        c.helper.api.stix_cyber_observable.list.return_value = []
+        c.helper.api.stix_cyber_observable.create.return_value = {"id": "obs-new"}
+        entry = _ioc_entry(query_name="shared_auth_ips")
+
+        c._import_ioc(entry, "test query")
+
+        label_calls = [call.kwargs.get("value") for call in c.helper.api.label.create.call_args_list]
+        assert "vectra-metadata-benign" in label_calls
+        assert "vectra-metadata-popular-ip" not in label_calls
+
     def test_no_duplicate_note_across_cycles(self):
         """V4: second cycle for same observable with fp-candidate already present → no new note."""
         c = _make_conn()
-        # Existing observable with fp-candidate already applied
-        existing = self._existing_obs(labels=["fp-candidate", "vectra-metadata-benign"])
+        # Existing observable with source labels already applied
+        existing = self._existing_obs(labels=[
+            "fp-candidate", "vectra-metadata-benign", "vectra-metadata-popular-ip"
+        ])
         c.helper.api.stix_cyber_observable.list.return_value = [existing]
 
         c._import_ioc(_ioc_entry(), "test query")
@@ -709,8 +851,11 @@ class TestImportIoc:
         c = _make_conn()
         existing = self._existing_obs(labels=["fp-candidate"])  # missing vectra-benign
         c.helper.api.stix_cyber_observable.list.return_value = [existing]
+        entry = _ioc_entry(
+            ioc_type="Domain-Name", value="example.com", query_name="broad_reach_dns"
+        )
 
-        c._import_ioc(_ioc_entry(), "test query")
+        c._import_ioc(entry, "test query")
 
         label_calls = [call.kwargs.get("value") for call in c.helper.api.label.create.call_args_list]
         assert "vectra-metadata-benign" in label_calls
@@ -722,13 +867,73 @@ class TestImportIoc:
         c = _make_conn()
         existing = self._existing_obs(labels=["fp-candidate", "vectra-metadata-benign"])
         c.helper.api.stix_cyber_observable.list.return_value = [existing]
+        entry = _ioc_entry(
+            ioc_type="Domain-Name", value="example.com", query_name="broad_reach_dns"
+        )
 
-        c._import_ioc(_ioc_entry(), "test query")
+        c._import_ioc(entry, "test query")
 
         label_calls = [call.kwargs.get("value") for call in c.helper.api.label.create.call_args_list]
         # Neither fp nor vectra-benign should be re-added (both present)
         assert "fp-candidate" not in label_calls
         assert "vectra-metadata-benign" not in label_calls
+
+
+class TestCycleAggregation:
+    """thx: collect duplicate query hits, import once, keep all signals."""
+
+    class _FakeQuery:
+        def __init__(self, name, label):
+            self.name = name
+            self.label = label
+
+        def build_sql(self, **kwargs):
+            return self.name
+
+        def extract_iocs(self, rows):
+            yield from rows
+
+    def test_duplicate_ioc_imported_once_with_all_query_names_in_note(self):
+        import connector as connector_mod
+        c = _make_conn()
+        c.helper.api.stix_cyber_observable.list.return_value = []
+        c.helper.api.stix_cyber_observable.create.return_value = {"id": "obs-new"}
+
+        q1 = self._FakeQuery("q1", "First signal")
+        q2 = self._FakeQuery("q2", "Second signal")
+        client = MagicMock()
+        client.execute.side_effect = lambda sql: {
+            "q1": [_ioc_entry(value="1.2.3.4", breadth=20, query_name="q1")],
+            "q2": [_ioc_entry(value="1.2.3.4", breadth=80, query_name="q2")],
+        }[sql]
+
+        with patch.object(connector_mod, "ALL_QUERIES", [q1, q2]):
+            c._run_cycle(client)
+
+        assert c.helper.api.stix_cyber_observable.list.call_count == 1
+        assert c.helper.api.stix_cyber_observable.create.call_count == 1
+        note = c.helper.api.note.create.call_args.kwargs
+        assert "q1" in note["content"]
+        assert "q2" in note["content"]
+        assert "First signal" in note["content"]
+        assert "Second signal" in note["content"]
+        assert "breadth=80" in note["abstract"]
+
+    def test_cycle_summary_reports_skipped_missing(self):
+        import connector as connector_mod
+        c = _make_conn({"VECTRA_FP_CREATE_MISSING": "false"})
+        c.helper.api.stix_cyber_observable.list.return_value = []
+
+        q1 = self._FakeQuery("q1", "First signal")
+        client = MagicMock()
+        client.execute.return_value = [_ioc_entry(value="1.2.3.4", query_name="q1")]
+
+        with patch.object(connector_mod, "ALL_QUERIES", [q1]):
+            c._run_cycle(client)
+
+        c.helper.api.stix_cyber_observable.create.assert_not_called()
+        logs = "\n".join(str(call.args[0]) for call in c.helper.log_info.call_args_list)
+        assert "skipped_missing=1" in logs
 
 
 class TestNativeExecuteV6:

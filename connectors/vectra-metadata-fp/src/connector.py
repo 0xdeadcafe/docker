@@ -9,25 +9,24 @@ OS telemetry, corporate proxies) and a direct analogue of the ubiquity
 heuristic in the ioc-trust-cluster connector.
 
 Each discovered observable (new or existing) is labelled in OpenCTI with:
-  - Labels: fp-candidate, vectra-metadata-benign, breadth:<tier>
-    Applied to newly created observables AND to existing observables that are
-    missing the fp-candidate label, ensuring pre-existing high-breadth IOCs
-    are correctly marked and flow into ioc-trust-cluster's cascade pipeline.
+  - Labels: vectra-metadata-benign or vectra-metadata-popular-ip, breadth:<tier>
+    Raw Q1 broad-reach IPs get the weaker popular-ip label by default; stronger
+    domain/M365 signals get vectra-metadata-benign. The cascade-capable
+    fp-candidate label is opt-in via VECTRA_FP_APPLY_FP_CANDIDATE=true.
   - x_opencti_score = VECTRA_FP_SCORE (default 15) is set only when the
     connector creates a new observable; existing scores are never overwritten.
-  - A Note with the metadata context is attached whenever fp-candidate is
+  - A Note with the metadata context is attached whenever the source label is
     newly applied — whether the observable is brand-new or pre-existing.
   - breadth:<tier> is refreshed when the observable moves to a higher tier;
     previous tier labels are retained for audit history.
 
 Safety guard: if an observable already exists with score ≥
 VECTRA_FP_MALICIOUS_GUARD_SCORE (default 70) — i.e. a feed connector has
-independently confirmed it as malicious — the connector does NOT apply
-fp-candidate to it.
+independently confirmed it as malicious — the connector does NOT apply benign
+labels to it.
 
-Integration with ioc-trust-cluster: once an observable carries fp-candidate,
-ioc-trust-cluster's CONFIRMED_BENIGN cascade propagates the verdict down to
-all child observables in the same CIDR block / domain root / CA chain.
+Integration with ioc-trust-cluster: Vectra labels are source context by default.
+Only opt-in fp-candidate/explicit confirmed labels should feed cascade behavior.
 
 The 6 queries (all Trino SQL against Vectra Metadata):
 
@@ -56,13 +55,18 @@ from queries import ALL_QUERIES, IOCEntry, QueryDefinition
 
 LABEL_FP_CANDIDATE = "fp-candidate"
 LABEL_VECTRA_BENIGN = "vectra-metadata-benign"
+LABEL_VECTRA_POPULAR_IP = "vectra-metadata-popular-ip"
 
 COLOR_FP = "#2e7d32"         # green  — benign / fp candidate
 COLOR_VECTRA = "#0d47a1"     # dark blue — vectra-sourced
+COLOR_POPULAR_IP = "#6d4c41" # brown — weak popularity context
 COLOR_BREADTH = "#455a64"    # blue-grey — breadth tier
 
 # Context keys already captured in the note header — skip in the detail table.
-_CTX_SKIP = frozenset({'resp_ip', 'ip_address', 'domain', 'server_name', 'host', 'resp_domains'})
+_CTX_SKIP = frozenset({
+    'resp_ip', 'ip_address', 'domain', 'server_name', 'host', 'resp_domains',
+    '_matched_queries', '_query_labels', '_context_count',
+})
 
 
 # ─── connector ────────────────────────────────────────────────────────────────
@@ -124,6 +128,16 @@ class VectraMetadataFPConnector:
         self.fp_score: int          = int(os.environ.get("VECTRA_FP_SCORE",                "15"))
         self.confidence: int        = _conf
         self.malicious_guard: int   = int(os.environ.get("VECTRA_FP_MALICIOUS_GUARD_SCORE","70"))
+        self.apply_fp_candidate: bool = os.environ.get(
+                                        "VECTRA_FP_APPLY_FP_CANDIDATE", "false"
+                                    ).lower() == "true"
+        self.create_missing: bool     = os.environ.get(
+                                        "VECTRA_FP_CREATE_MISSING", "true"
+                                    ).lower() == "true"
+        self.strong_raw_ips: bool     = os.environ.get(
+                                        "VECTRA_FP_STRONG_RAW_IPS", "false"
+                                    ).lower() == "true"
+        self._skipped_missing: int    = 0
 
         # ── Vectra metadata client (lazy — created in run()) ───────────────
         self._client: VectraMetadataClient | None = None
@@ -200,6 +214,22 @@ class VectraMetadataFPConnector:
 
     # ── OpenCTI observable helpers ─────────────────────────────────────────────
 
+    @staticmethod
+    def _query_names(entry: IOCEntry) -> set[str]:
+        raw = entry.context.get('_matched_queries') if isinstance(entry.context, dict) else None
+        if raw:
+            return {str(q) for q in raw}
+        return {q for q in str(entry.query_name).split(',') if q}
+
+    def _source_labels(self, entry: IOCEntry) -> list[tuple[str, str]]:
+        queries = self._query_names(entry)
+        labels: list[tuple[str, str]] = []
+        if 'broad_reach_ips' in queries:
+            labels.append((LABEL_VECTRA_POPULAR_IP, COLOR_POPULAR_IP))
+        if self.strong_raw_ips or any(q != 'broad_reach_ips' for q in queries):
+            labels.append((LABEL_VECTRA_BENIGN, COLOR_VECTRA))
+        return labels
+
     def _find_observable(self, obs_type: str, value: str) -> dict | None:
         try:
             results = self.helper.api.stix_cyber_observable.list(
@@ -271,13 +301,21 @@ class VectraMetadataFPConnector:
             f"| `{k}` | `{v}` |" for k, v in ctx_rows
         ) if ctx_rows else "*(no additional context)*"
 
+        query_labels = ctx.get('_query_labels') or {entry.query_name: query_label}
+        query_md = "\n".join(
+            f"- `{name}` — {label}" for name, label in query_labels.items()
+        )
+        breadth_subject = (
+            "users" if set(query_labels) == {"shared_auth_ips"}
+            else "internal hosts/users"
+        )
+
         content = (
             f"## Vectra Metadata — Benign IOC Discovery\n\n"
             f"**Observable:** `{entry.value}`  \n"
             f"**Type:** `{entry.ioc_type}`  \n"
-            f"**Discovery Query:** `{entry.query_name}` — {query_label}  \n"
-            f"**Host/User Breadth:** **{entry.breadth}** distinct "
-            f"{'users' if entry.query_name == 'shared_auth_ips' else 'internal hosts'}  \n"
+            f"**Discovery Queries:**\n{query_md}\n\n"
+            f"**Host/User Breadth:** **{entry.breadth}** distinct {breadth_subject}  \n"
             f"**Breadth Tier:** `{bucket}`  \n"
             f"**Lookback:** {self.lookback_days} days  \n\n"
             f"### Metadata Context\n\n"
@@ -291,7 +329,7 @@ class VectraMetadataFPConnector:
             self.helper.api.note.create(
                 abstract=(
                     f"Vectra FP: {entry.ioc_type}:{entry.value} "
-                    f"breadth={entry.breadth} [{entry.query_name}]"
+                    f"breadth={entry.breadth} [{', '.join(query_labels)}]"
                 ),
                 content=content,
                 objectRefs=[obs_id],
@@ -311,11 +349,10 @@ class VectraMetadataFPConnector:
           1. Dedup check (within this cycle)
           2. Find or create observable
           3. Safety guard — skip if existing score ≥ malicious_guard
-          4. Diff labels: apply fp-candidate, vectra-metadata-benign, and breadth
-             tier on new observables AND on existing ones that are missing them.
-             breadth:<tier> is also added when the observable has moved to a
-             higher tier since the last cycle (old tier label stays for history).
-          5. Attach a discovery note whenever fp-candidate is newly applied.
+          4. Diff labels: apply source label, breadth tier, and the opt-in
+             fp-candidate label on observables missing them.
+          5. Attach a discovery note whenever the source/cascade label is newly
+             applied.
         """
         key = (entry.ioc_type, entry.value)
         if key in self._seen_this_cycle:
@@ -324,7 +361,8 @@ class VectraMetadataFPConnector:
 
         existing = self._find_observable(entry.ioc_type, entry.value)
         if existing:
-            existing_score = int(existing.get("x_opencti_score") or 50)
+            raw_score = existing.get("x_opencti_score")
+            existing_score = int(raw_score) if raw_score is not None else 50
             if existing_score >= self.malicious_guard:
                 self.helper.log_info(
                     f"[vectra-fp] SKIP confirmed-malicious "
@@ -338,6 +376,13 @@ class VectraMetadataFPConnector:
             }
             is_new = False
         else:
+            if not self.create_missing:
+                self._skipped_missing += 1
+                self.helper.log_debug(
+                    f"[vectra-fp] skip missing {entry.ioc_type}:{entry.value} "
+                    "(VECTRA_FP_CREATE_MISSING=false)"
+                )
+                return False
             obs_id = self._create_observable(entry.ioc_type, entry.value)
             if not obs_id:
                 return False
@@ -345,27 +390,34 @@ class VectraMetadataFPConnector:
             is_new = True
 
         new_bucket = self._breadth_bucket(entry.breadth)
-        needs_fp  = LABEL_FP_CANDIDATE  not in existing_labels
-        needs_vec = LABEL_VECTRA_BENIGN not in existing_labels
+        needs_fp  = self.apply_fp_candidate and LABEL_FP_CANDIDATE not in existing_labels
+        source_labels = [
+            (label, color) for label, color in self._source_labels(entry)
+            if label not in existing_labels
+        ]
         needs_breadth_lbl = f"breadth:{new_bucket}" not in existing_labels
 
-        if not needs_fp and not needs_vec and not needs_breadth_lbl:
+        if not needs_fp and not source_labels and not needs_breadth_lbl:
             self.helper.log_debug(
                 f"[vectra-fp] seen {entry.ioc_type}:{entry.value} "
                 f"breadth={entry.breadth} query={entry.query_name}"
             )
             return False
 
-        # Apply fp labels independently so a failure on the second label
-        # (vectra-metadata-benign) is retried next cycle even after fp-candidate
-        # succeeds.  Note is only attached when fp-candidate is newly applied
-        # successfully — this deduplicates notes across cycles naturally.
+        # Apply labels independently so failures are retried next cycle.
+        # Note is attached when the first source/cascade label is newly applied;
+        # this deduplicates notes across cycles naturally.
+        noted = False
         if needs_fp:
             ok_fp = self._add_label(obs_id, LABEL_FP_CANDIDATE, COLOR_FP)
             if ok_fp:
                 self._add_discovery_note(obs_id, entry, query_label)
-        if needs_vec:
-            self._add_label(obs_id, LABEL_VECTRA_BENIGN, COLOR_VECTRA)
+                noted = True
+        for label, color in source_labels:
+            ok_source = self._add_label(obs_id, label, color)
+            if ok_source and not noted:
+                self._add_discovery_note(obs_id, entry, query_label)
+                noted = True
 
         if needs_breadth_lbl:
             self._add_label(obs_id, f"breadth:{new_bucket}", COLOR_BREADTH)
@@ -379,13 +431,45 @@ class VectraMetadataFPConnector:
 
     # ── query execution ────────────────────────────────────────────────────────
 
-    def _process_query(
-        self, qdef: QueryDefinition, client: VectraMetadataClient
-    ) -> tuple[int, int, int]:
-        """
-        Execute one query and import all extracted IOCs.
+    @staticmethod
+    def _collect_ioc(
+        aggregate: dict[tuple[str, str], dict], entry: IOCEntry, query_label: str
+    ) -> None:
+        key = (entry.ioc_type, entry.value)
+        item = aggregate.setdefault(
+            key,
+            {"entry": entry, "query_labels": {}, "context_count": 0},
+        )
+        if entry.breadth > item["entry"].breadth:
+            item["entry"] = entry
+        item["query_labels"][entry.query_name] = query_label
+        item["context_count"] += 1
 
-        Returns: (rows_returned, iocs_extracted, iocs_imported)
+    @staticmethod
+    def _aggregated_entry(item: dict) -> IOCEntry:
+        best: IOCEntry = item["entry"]
+        ctx = dict(best.context)
+        ctx["_query_labels"] = item["query_labels"]
+        ctx["_matched_queries"] = list(item["query_labels"])
+        ctx["_context_count"] = item["context_count"]
+        return IOCEntry(
+            ioc_type=best.ioc_type,
+            value=best.value,
+            breadth=best.breadth,
+            query_name=",".join(item["query_labels"]),
+            context=ctx,
+        )
+
+    def _process_query(
+        self,
+        qdef: QueryDefinition,
+        client: VectraMetadataClient,
+        aggregate: dict[tuple[str, str], dict],
+    ) -> tuple[int, int]:
+        """
+        Execute one query and collect extracted IOCs.
+
+        Returns: (rows_returned, iocs_extracted)
         """
         sql = qdef.build_sql(
             days=self.lookback_days,
@@ -407,46 +491,52 @@ class VectraMetadataFPConnector:
             self.helper.log_error(
                 f"[vectra-fp] query {qdef.name} failed: {exc}"
             )
-            return 0, 0, 0
+            return 0, 0
 
         n_rows = len(rows)
         n_iocs = 0
-        n_imported = 0
 
         for entry in qdef.extract_iocs(rows):
             n_iocs += 1
-            if self._import_ioc(entry, qdef.label):
-                n_imported += 1
+            self._collect_ioc(aggregate, entry, qdef.label)
 
         self.helper.log_info(
-            f"[vectra-fp] {qdef.name}: "
-            f"rows={n_rows} iocs={n_iocs} imported={n_imported}"
+            f"[vectra-fp] {qdef.name}: rows={n_rows} iocs={n_iocs}"
         )
-        return n_rows, n_iocs, n_imported
+        return n_rows, n_iocs
 
     # ── cycle ──────────────────────────────────────────────────────────────────
 
     def _run_cycle(self, client: VectraMetadataClient) -> None:
         """Execute all 6 queries and import results for one cycle."""
         self._seen_this_cycle = set()
+        self._skipped_missing = 0
         cycle_start = time.monotonic()
 
         total_rows = total_iocs = total_imported = 0
+        aggregate: dict[tuple[str, str], dict] = {}
 
         for idx, qdef in enumerate(ALL_QUERIES):
             if idx > 0 and self.inter_query_delay_sec > 0:
                 time.sleep(self.inter_query_delay_sec)
-            r, n, imp = self._process_query(qdef, client)
-            total_rows     += r
-            total_iocs     += n
-            total_imported += imp
+            r, n = self._process_query(qdef, client, aggregate)
+            total_rows += r
+            total_iocs += n
+
+        for item in aggregate.values():
+            entry = self._aggregated_entry(item)
+            query_label = "; ".join(item["query_labels"].values())
+            if self._import_ioc(entry, query_label):
+                total_imported += 1
 
         elapsed = time.monotonic() - cycle_start
         self.helper.log_info(
             f"[vectra-fp] cycle complete: "
             f"total_rows={total_rows} "
             f"total_iocs_extracted={total_iocs} "
+            f"unique_iocs={len(aggregate)} "
             f"total_imported={total_imported} "
+            f"skipped_missing={self._skipped_missing} "
             f"elapsed={elapsed:.1f}s "
             f"next_run_in={self.interval_sec}s"
         )

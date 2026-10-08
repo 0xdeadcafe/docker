@@ -4,7 +4,7 @@ Single OpenCTI connector for IOC trust edges and one-hop verdict fanout.
 
 ## Trust edges vs label-only grouping
 
-Only relationship-backed parent observables (`IPv4-Addr`, `IPv6-Addr`, `Domain-Name`) participate in new trust edges and verdict fanout. X509 issuer-DN strings are not stable certificate identities, so the connector does not create synthetic CA parents. `Network-Traffic` JA4 profiles and `Autonomous-System` owners are label-only grouping aids: they add `trust-cluster:*` labels for triage, but create no relationship and never cascade verdicts.
+Only relationship-backed parent observables (`IPv4-Addr`, `IPv6-Addr`, `Domain-Name`) participate in trust edges and verdict fanout. New structural trust is graph-only: child observables link to parent observables with connector-owned relationships, and CIDR anchors link to AS observables with `belongs-to`. X509 issuer-DN strings are not stable certificate identities, so the connector does not create synthetic CA parents. `Network-Traffic` JA4 profiles and direct `Autonomous-System` owner grouping remain label-only display aids; they never cascade verdicts.
 
 Inherited verdict labels are namespaced (`trust-cluster:malicious-cascade`, `trust-cluster:fp-candidate`) so the connector can remove only state it owns. Generic `malicious-cascade` / `fp-candidate` labels from analysts, feeds, or old runs are never auto-removed.
 

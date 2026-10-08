@@ -144,9 +144,9 @@ def _parse_resp_domains(value: object) -> list[str]:
 _SQL_BROAD_REACH_IPS = """\
 SELECT
     id.resp_h                       AS resp_ip,
-    COALESCE(resp_domain, '')       AS resp_domain,
-    id.resp_p                       AS resp_port,
-    COALESCE(service,    '')        AS service,
+    COUNT(DISTINCT resp_domain)     AS resp_domain_count,
+    COUNT(DISTINCT id.resp_p)       AS resp_port_count,
+    COUNT(DISTINCT service)         AS service_count,
     COUNT(DISTINCT id.orig_h)       AS src_host_count,
     COUNT(*)                        AS session_count,
     SUM(orig_ip_bytes)              AS total_orig_bytes,
@@ -159,7 +159,7 @@ WHERE local_resp  = FALSE
   AND id.resp_h  IS NOT NULL
   AND dt        > date_add('day', -{days}, now())
   AND timestamp  BETWEEN date_add('day', -{days}, now()) AND now()
-GROUP BY id.resp_h, resp_domain, id.resp_p, service
+GROUP BY id.resp_h
 HAVING COUNT(DISTINCT id.orig_h) >= {host_threshold}
 ORDER BY src_host_count DESC, session_count DESC
 LIMIT {max_results}
@@ -303,7 +303,11 @@ def _extract_broad_reach_tls_sni(query_name: str, row: dict) -> Iterator[IOCEntr
 
 _SQL_BROAD_REACH_HTTP = """\
 SELECT
-    host,
+    CASE
+        WHEN REGEXP_LIKE(host, '^[^:]+:[0-9]+$')
+        THEN REGEXP_REPLACE(host, ':[0-9]+$', '')
+        ELSE host
+    END                                                                     AS host,
     COUNT(DISTINCT id.orig_h)                                               AS src_host_count,
     COUNT(*)                                                                AS request_count,
     COUNT(CASE WHEN status_code BETWEEN 200 AND 399 THEN 1 END)            AS success_count,
@@ -319,7 +323,11 @@ WHERE host IS NOT NULL
       '^(10\\.|192\\.168\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.|127\\.|169\\.254\\.)')
   AND dt        > date_add('day', -{days}, now())
   AND timestamp  BETWEEN date_add('day', -{days}, now()) AND now()
-GROUP BY host
+GROUP BY CASE
+        WHEN REGEXP_LIKE(host, '^[^:]+:[0-9]+$')
+        THEN REGEXP_REPLACE(host, ':[0-9]+$', '')
+        ELSE host
+    END
 HAVING COUNT(DISTINCT id.orig_h) >= {host_threshold}
    AND COUNT(CASE WHEN status_code BETWEEN 200 AND 399 THEN 1 END) > 0
 ORDER BY src_host_count DESC, request_count DESC
@@ -371,8 +379,8 @@ _SQL_BENIGN_BEACONS = """\
 SELECT
     resp_domains,
     id.resp_h                       AS resp_ip,
-    COALESCE(service,    '')        AS service,
-    COALESCE(beacon_type,'')        AS beacon_type,
+    COUNT(DISTINCT service)         AS service_count,
+    COUNT(DISTINCT beacon_type)     AS beacon_type_count,
     COUNT(DISTINCT id.orig_h)       AS src_host_count,
     COUNT(*)                        AS beacon_record_count,
     SUM(session_count)              AS total_sessions,
@@ -386,7 +394,7 @@ WHERE beacon_type IN ('regular', 'known', 'normal', 'periodic', 'automated', 'be
       '^(10\\.|192\\.168\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.|127\\.|169\\.254\\.)')
   AND dt           > date_add('day', -{days}, now())
   AND first_event_time BETWEEN date_add('day', -{days}, now()) AND now()
-GROUP BY resp_domains, id.resp_h, service, beacon_type
+GROUP BY resp_domains, id.resp_h
 HAVING COUNT(DISTINCT id.orig_h) >= {host_threshold}
 ORDER BY src_host_count DESC, total_sessions DESC
 LIMIT {max_results}
