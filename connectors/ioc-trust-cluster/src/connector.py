@@ -102,6 +102,10 @@ LABEL_INHERITED_FP_CANDIDATE      = f"{CLUSTER_LABEL_PREFIX}:fp-candidate"
 LABEL_INHERITED_MALICIOUS_CASCADE = f"{CLUSTER_LABEL_PREFIX}:malicious-cascade"
 INHERITED_STATE_LABELS = {LABEL_INHERITED_FP_CANDIDATE, LABEL_INHERITED_MALICIOUS_CASCADE}
 TRUST_REL_DESCRIPTION   = "IOC trust-cluster structural parent link (auto-created)"
+# OpenCTI rejects belongs-to between SCO parentage pairs (IP→CIDR,
+# URL→host, subdomain→domain). Keep related-to for those structural edges;
+# belongs-to is used where OpenCTI allows ownership, e.g. CIDR→AS.
+TRUST_REL_TYPE          = "related-to"
 ASN_REL_DESCRIPTION     = "IOC trust-cluster CIDR to ASN ownership link (auto-created)"
 
 COLOR_CLUSTER   = "#1565c0"   # blue   — structural grouping
@@ -764,24 +768,38 @@ class IocTrustClusterConnector:
             return None
         return ('Domain-Name', pv)
 
+    def _trust_relationships(self, **kwargs) -> list[dict]:
+        """Return connector-owned structural parent edges."""
+        rels: list[dict] = []
+        seen: set[tuple[str | None, str | None]] = set()
+        for rel_type in (TRUST_REL_TYPE,):
+            try:
+                found = self.helper.api.stix_core_relationship.list(
+                    relationship_type=rel_type,
+                    getAll=True,
+                    **kwargs,
+                ) or []
+            except Exception as e:
+                self.helper.log_warning(
+                    f"[trust-cluster] relationship lookup failed ({rel_type}): {e}"
+                )
+                continue
+            for rel in found:
+                if TRUST_REL_DESCRIPTION not in (rel.get("description") or ""):
+                    continue
+                key = (rel.get("fromId") or (rel.get("from") or {}).get("id"),
+                       rel.get("toId") or (rel.get("to") or {}).get("id"))
+                if key in seen:
+                    continue
+                seen.add(key)
+                rels.append(rel)
+        return rels
+
     def _trust_relationship_parents(self, child_id: str) -> list[dict]:
         """Return parent observables from connector-created child→parent edges."""
-        try:
-            rels = self.helper.api.stix_core_relationship.list(
-                fromId=child_id,
-                relationship_type="related-to",
-                getAll=True,
-            ) or []
-        except Exception as e:
-            self.helper.log_warning(
-                f"[trust-cluster] relationship lookup failed for {child_id}: {e}"
-            )
-            return []
-
         parents: list[dict] = []
-        for rel in rels:
-            if TRUST_REL_DESCRIPTION not in (rel.get("description") or ""):
-                continue
+        seen_parent_ids: set[str] = set()
+        for rel in self._trust_relationships(fromId=child_id):
             parent = rel.get("to") or rel.get("toEntity") or rel.get("target") or {}
             parent_id = parent.get("id") or rel.get("toId")
             if parent_id and (
@@ -797,6 +815,10 @@ class IocTrustClusterConnector:
                     )
                     continue
             if parent:
+                pid = parent.get("id") or parent_id
+                if pid in seen_parent_ids:
+                    continue
+                seen_parent_ids.add(pid)
                 parents.append(parent)
         return parents
 
@@ -829,22 +851,9 @@ class IocTrustClusterConnector:
 
     def _trust_relationship_children(self, parent_id: str) -> list[dict]:
         """Return direct child observables from connector-created child→parent edges."""
-        try:
-            rels = self.helper.api.stix_core_relationship.list(
-                toId=parent_id,
-                relationship_type="related-to",
-                getAll=True,
-            ) or []
-        except Exception as e:
-            self.helper.log_warning(
-                f"[trust-cluster] child relationship lookup failed for {parent_id}: {e}"
-            )
-            return []
-
         children: list[dict] = []
-        for rel in rels:
-            if TRUST_REL_DESCRIPTION not in (rel.get("description") or ""):
-                continue
+        seen_child_ids: set[str] = set()
+        for rel in self._trust_relationships(toId=parent_id):
             child = rel.get("from") or rel.get("fromEntity") or rel.get("source") or {}
             child_id = child.get("id") or rel.get("fromId")
             if child_id and ("x_opencti_score" not in child or "objectLabel" not in child):
@@ -856,6 +865,10 @@ class IocTrustClusterConnector:
                     )
                     continue
             if child:
+                cid = child.get("id") or child_id
+                if cid in seen_child_ids:
+                    continue
+                seen_child_ids.add(cid)
                 children.append(child)
         return children
 
@@ -939,7 +952,7 @@ class IocTrustClusterConnector:
 
     def _ensure_relationship(self, child_id: str, parent_id: str) -> bool:
         return self._ensure_core_relationship(
-            child_id, parent_id, "related-to", TRUST_REL_DESCRIPTION
+            child_id, parent_id, TRUST_REL_TYPE, TRUST_REL_DESCRIPTION
         )
 
     def _find_or_create_asn(self, asn: str, owner: str | None) -> dict | None:

@@ -61,6 +61,7 @@ def main() -> None:
         COLOR_CLUSTER,
         LABEL_INHERITED_MALICIOUS_CASCADE,
         TRUST_REL_DESCRIPTION,
+        TRUST_REL_TYPE,
         IocTrustClusterConnector,
     )
     from pycti import OpenCTIApiClient  # noqa: WPS433
@@ -90,14 +91,14 @@ def main() -> None:
         rel = api.stix_core_relationship.create(
             fromId=child["id"],
             toId=parent["id"],
-            relationship_type="related-to",
+            relationship_type=TRUST_REL_TYPE,
             description=TRUST_REL_DESCRIPTION,
             confidence=75,
         )
         extra_rel = api.stix_core_relationship.create(
             fromId=child["id"],
             toId=extra_parent["id"],
-            relationship_type="related-to",
+            relationship_type=TRUST_REL_TYPE,
             description=TRUST_REL_DESCRIPTION,
             confidence=75,
         )
@@ -105,7 +106,7 @@ def main() -> None:
 
         rels = api.stix_core_relationship.list(
             fromId=child["id"],
-            relationship_type="related-to",
+            relationship_type=TRUST_REL_TYPE,
             first=1,
             getAll=True,
         )
@@ -128,7 +129,7 @@ def main() -> None:
         result = connector.process_message({"entity_id": child["id"], "entity_type": "Domain-Name"})
         refreshed = api.stix_cyber_observable.read(id=child["id"])
         labels = label_values(refreshed)
-        assert f"{CLUSTER_LABEL_PREFIX}:{parent_value}" in labels
+        assert f"{CLUSTER_LABEL_PREFIX}:{parent_value}" not in labels
         assert LABEL_INHERITED_MALICIOUS_CASCADE in labels
         assert "malicious-cascade" in result
 

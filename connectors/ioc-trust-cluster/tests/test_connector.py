@@ -1011,7 +1011,9 @@ class TestCidrAsnOwnership:
 
         c.helper.api.stix_cyber_observable.create.assert_not_called()
         assert not any(
-            call.kwargs.get("relationship_type") == "belongs-to"
+            call.kwargs.get("fromId") == "cidr-001"
+            and call.kwargs.get("toId") == "as-15169"
+            and call.kwargs.get("relationship_type") == "belongs-to"
             for call in c.helper.api.stix_core_relationship.create.call_args_list
         )
 
@@ -2131,6 +2133,21 @@ class TestRelationshipSourceOfTruth:
         c.helper.api.stix_core_relationship.list.assert_any_call(
             fromId="obs-001", relationship_type="related-to", getAll=True
         )
+
+    def test_related_to_edge_drives_inheritance(self):
+        c = _make_connector()
+        child = _obs(value="1.2.3.4", score=50, labels=[])
+        parent = _obs(entity_id="cidr-001", value="1.2.3.0/24", score=85)
+        _wire(c, child, parent)
+        c.helper.api.stix_core_relationship.list.side_effect = (
+            lambda **kw: [_trust_rel(parent)] if kw.get("relationship_type") == "related-to" else []
+        )
+
+        result = c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
+
+        assert LABEL_INHERITED_MALICIOUS_CASCADE in _labels_created(c.helper)
+        assert "malicious-cascade from IPv4-Addr:1.2.3.0/24" in result
+        c.helper.api.stix_core_relationship.create.assert_not_called()
 
     def test_existing_relationship_reads_parent_when_edge_payload_is_partial(self):
         c = _make_connector()

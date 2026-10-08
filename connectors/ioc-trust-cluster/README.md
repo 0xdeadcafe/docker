@@ -4,7 +4,7 @@ Single OpenCTI connector for IOC trust edges and one-hop verdict fanout.
 
 ## Trust edges vs label-only grouping
 
-Only relationship-backed parent observables (`IPv4-Addr`, `IPv6-Addr`, `Domain-Name`) participate in trust edges and verdict fanout. New structural trust is graph-only: child observables link to parent observables with connector-owned relationships, and CIDR anchors link to AS observables with `belongs-to`. X509 issuer-DN strings are not stable certificate identities, so the connector does not create synthetic CA parents. `Network-Traffic` JA4 profiles and direct `Autonomous-System` owner grouping remain label-only display aids; they never cascade verdicts.
+Only relationship-backed parent observables (`IPv4-Addr`, `IPv6-Addr`, `Domain-Name`) participate in trust edges and verdict fanout. Structural trust is graph-only: child observables link to parent observables with connector-owned `related-to` relationships because OpenCTI rejects `belongs-to` for SCO parentage pairs such as IP→CIDR, URL→host, and subdomain→domain. CIDR anchors link to AS observables with `belongs-to`, where OpenCTI allows ownership semantics. See `docs/decisions/trust-parent-relationship-semantics.md`. X509 issuer-DN strings are not stable certificate identities, so the connector does not create synthetic CA parents. `Network-Traffic` JA4 profiles and direct `Autonomous-System` owner grouping remain label-only display aids; they never cascade verdicts.
 
 Inherited verdict labels are namespaced (`trust-cluster:malicious-cascade`, `trust-cluster:fp-candidate`) so the connector can remove only state it owns. Generic `malicious-cascade` / `fp-candidate` labels from analysts, feeds, or old runs are never auto-removed.
 
@@ -24,7 +24,7 @@ export OPENCTI_TOKEN=<admin/api token>
 python3 connectors/ioc-trust-cluster/scripts/opencti_trust_edge_contract.py
 ```
 
-Optional: set `CONNECTOR_ID` to the connector UUID and `TRUST_CONTRACT_KEEP=1` to keep the temporary observables for inspection. The script creates child→parent `related-to` edges, forces pycti pagination with `first=1,getAll=True`, adds/removes a connector-owned label, and calls `process_message` on the child.
+Optional: set `CONNECTOR_ID` to the connector UUID and `TRUST_CONTRACT_KEEP=1` to keep the temporary observables for inspection. The script creates child→parent `related-to` trust edges, forces pycti pagination with `first=1,getAll=True`, adds/removes a connector-owned label, and calls `process_message` on the child.
 
 ## CIDR parent rule
 
