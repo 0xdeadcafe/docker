@@ -346,16 +346,13 @@ services:
       - CONNECTOR_NAME=IPQualityScore
       # IPQS connector does not support IPv6-Addr; adding it causes runtime ValueError.
       - CONNECTOR_SCOPE=IPv4-Addr,Domain-Name,Url
-      # Set false while IPQS credits are exhausted to avoid retry noise.
-      - CONNECTOR_AUTO=true
+      # Paid enrichment is user-requested through OpenCTI UI/GraphQL only.
+      - CONNECTOR_AUTO=false
       - CONNECTOR_CONFIDENCE_LEVEL=80
-      - IPQS_API_KEY=${IPQS_API_KEY}
       - IPQS_PRIVATE_KEY=${IPQS_API_KEY}
-      - IPQS_ABUSE_EMAILS=true
-      - IPQS_ALLOW_PUBLIC_ACCESS_POINTS=true
-      - IPQS_FAST=false
-      - IPQS_LIGHTER_PENALTIES=true
-      - IPQS_STRICTNESS=1
+      - IPQS_MAX_TLP=TLP:AMBER
+      - IPQS_IP_ADD_RELATIONSHIPS=false
+      - IPQS_DOMAIN_ADD_RELATIONSHIPS=true
     restart: always
     depends_on:
       opencti:
@@ -390,15 +387,19 @@ services:
       - OPENCTI_TOKEN=${OPENCTI_ADMIN_TOKEN}
       - CONNECTOR_ID=${CONNECTOR_VIRUSTOTAL_ID}
       - CONNECTOR_NAME=VirusTotal
-      - CONNECTOR_SCOPE=StixFile,Artifact,IPv4-Addr,Domain-Name,Url
-      - CONNECTOR_AUTO=true
+      # URLs stay with IPQS: VirusTotal URL enrichment performs extra API lookups.
+      - CONNECTOR_SCOPE=StixFile,Artifact,IPv4-Addr,Domain-Name
+      # Paid enrichment is user-requested through OpenCTI UI/GraphQL only.
+      - CONNECTOR_AUTO=false
       - CONNECTOR_CONFIDENCE_LEVEL=75
       - VIRUSTOTAL_TOKEN=${VT_API_KEY}
       - VIRUSTOTAL_MAX_TLP=TLP:AMBER
       - VIRUSTOTAL_REPLACE_WITH_LOWER_SCORE=true
+      - VIRUSTOTAL_FILE_UPLOAD_UNSEEN_ARTIFACTS=false
+      - VIRUSTOTAL_URL_UPLOAD_UNSEEN=false
+      - VIRUSTOTAL_FILE_IMPORT_YARA=false
       - VIRUSTOTAL_IP_ADD_RELATIONSHIPS=true
       - VIRUSTOTAL_DOMAIN_ADD_RELATIONSHIPS=true
-      - VIRUSTOTAL_COOLDOWN_SECONDS=15
     restart: always
     depends_on:
       opencti:

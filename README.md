@@ -4,6 +4,48 @@
 
 You can find the detailed documentation about the Docker installation in the [OpenCTI documentation space](https://docs.opencti.io/latest/deployment/installation/#using-docker).
 
+## VirusTotal and IPQS enrichment
+
+VirusTotal and IPQS are paid, on-demand enrichment connectors. They stay running with `CONNECTOR_AUTO=false`; importing an observable does not call either provider. An authorized user must select a connector in the OpenCTI UI or request it through GraphQL. IPQS handles IPv4 addresses, domains, and URLs. VirusTotal handles files, artifacts, IPv4 addresses, and domains.
+
+### One-time rollout
+
+The old automatic configuration may have queued enrichment work. During a maintenance window, stop both connectors, purge only their listener queues, and recreate them:
+
+```bash
+set -a; source .env; set +a
+
+docker compose stop connector-ipqs connector-virustotal
+docker compose exec rabbitmq rabbitmqctl purge_queue "listen_${CONNECTOR_IPQS_ID}"
+docker compose exec rabbitmq rabbitmqctl purge_queue "listen_${CONNECTOR_VIRUSTOTAL_ID}"
+docker compose up -d --force-recreate connector-ipqs connector-virustotal
+
+docker compose exec rabbitmq rabbitmqctl list_queues \
+  name messages_ready messages_unacknowledged | \
+  grep -E "listen_(${CONNECTOR_IPQS_ID}|${CONNECTOR_VIRUSTOTAL_ID})"
+```
+
+Both queues should remain at zero until a user requests enrichment.
+
+### GraphQL request
+
+Set `OBSERVABLE_ID` to the OpenCTI object ID and choose exactly one connector ID. Each request can consume provider quota.
+
+```bash
+set -a; source .env; set +a
+export OBSERVABLE_ID='<observable-id>'
+export ENRICHMENT_CONNECTOR_ID="$CONNECTOR_IPQS_ID" # or CONNECTOR_VIRUSTOTAL_ID
+
+curl --fail-with-body "http://localhost:${OPENCTI_PORT:-8080}/graphql" \
+  -H "Authorization: Bearer ${OPENCTI_ADMIN_TOKEN}" \
+  -H 'Content-Type: application/json' \
+  --data-binary @- <<JSON
+{"query":"mutation Enrich(\$id: ID!, \$connectorId: ID!) { stixCoreObjectEdit(id: \$id) { askEnrichment(connectorId: \$connectorId) { id } } }","variables":{"id":"${OBSERVABLE_ID}","connectorId":"${ENRICHMENT_CONNECTOR_ID}"}}
+JSON
+```
+
+A successful response contains the created work ID under `data.stixCoreObjectEdit.askEnrichment.id`.
+
 ## XTM One
 
 This stack bundles [XTM One](https://filigran.io), Filigran's AI-powered assistant, alongside OpenCTI. The following services are started by default:
