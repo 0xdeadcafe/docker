@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -40,6 +41,15 @@ def endpoint_id(rel: dict, side: str) -> str | None:
     return rel.get(f"{side}Id") or (rel.get(side) or {}).get("id")
 
 
+def wait_for_label(api, observable_id: str, value: str, present: bool = True) -> dict:
+    for _ in range(20):
+        entity = api.stix_cyber_observable.read(id=observable_id)
+        if (value in label_values(entity)) is present:
+            return entity
+        time.sleep(0.25)
+    raise AssertionError(f"label {value!r} did not become present={present}")
+
+
 def create_domain(api, value: str, score: int) -> dict:
     return api.stix_cyber_observable.create(
         observableData={
@@ -59,6 +69,9 @@ def main() -> None:
     from connector import (  # noqa: WPS433 - opt-in script, fail only when run
         CLUSTER_LABEL_PREFIX,
         COLOR_CLUSTER,
+        COLOR_FP,
+        LABEL_FP_CONFIRMED,
+        LABEL_INHERITED_FP_CANDIDATE,
         LABEL_INHERITED_MALICIOUS_CASCADE,
         TRUST_REL_DESCRIPTION,
         TRUST_REL_TYPE,
@@ -75,18 +88,32 @@ def main() -> None:
     suffix = uuid.uuid4().hex[:12]
     child_value = f"trust-contract-child-{suffix}.example.com"
     parent_value = f"trust-contract-parent-{suffix}.example.com"
-    extra_parent_value = f"trust-contract-parent-extra-{suffix}.example.com"
+    benign_child_value = f"trust-contract-benign-child-{suffix}.example.com"
+    benign_parent_value = f"trust-contract-benign-parent-{suffix}.example.com"
     contract_label = f"{CLUSTER_LABEL_PREFIX}:contract:{suffix}"
 
     rel_ids: list[str] = []
     obs_ids: list[str] = []
+    contract_label_id: str | None = None
+    connector = None
     keep = os.environ.get("TRUST_CONTRACT_KEEP", "").lower() in {"1", "true", "yes"}
 
     try:
         child = create_domain(api, child_value, 50)
         parent = create_domain(api, parent_value, 85)
-        extra_parent = create_domain(api, extra_parent_value, 50)
-        obs_ids.extend([child["id"], parent["id"], extra_parent["id"]])
+        benign_child = create_domain(api, benign_child_value, 50)
+        benign_parent = create_domain(api, benign_parent_value, 20)
+        obs_ids.extend([
+            child["id"], parent["id"], benign_child["id"], benign_parent["id"]
+        ])
+
+        fp_label = api.label.create(value=LABEL_FP_CONFIRMED, color=COLOR_FP)
+        assert api.stix_cyber_observable.add_label(
+            id=benign_parent["id"], label_id=fp_label["id"]
+        )
+        benign_parent = wait_for_label(
+            api, benign_parent["id"], LABEL_FP_CONFIRMED
+        )
 
         rel = api.stix_core_relationship.create(
             fromId=child["id"],
@@ -97,12 +124,19 @@ def main() -> None:
         )
         extra_rel = api.stix_core_relationship.create(
             fromId=child["id"],
-            toId=extra_parent["id"],
+            toId=benign_parent["id"],
             relationship_type=TRUST_REL_TYPE,
             description=TRUST_REL_DESCRIPTION,
             confidence=75,
         )
-        rel_ids.extend([rel["id"], extra_rel["id"]])
+        benign_rel = api.stix_core_relationship.create(
+            fromId=benign_child["id"],
+            toId=benign_parent["id"],
+            relationship_type=TRUST_REL_TYPE,
+            description=TRUST_REL_DESCRIPTION,
+            confidence=75,
+        )
+        rel_ids.extend([rel["id"], extra_rel["id"], benign_rel["id"]])
 
         rels = api.stix_core_relationship.list(
             fromId=child["id"],
@@ -118,23 +152,40 @@ def main() -> None:
         assert (listed.get("to") or {}).get("observable_value") == parent_value
 
         label = api.label.create(value=contract_label, color=COLOR_CLUSTER)
+        contract_label_id = label["id"]
         assert api.stix_cyber_observable.add_label(id=child["id"], label_id=label["id"])
-        assert contract_label in label_values(api.stix_cyber_observable.read(id=child["id"]))
+        wait_for_label(api, child["id"], contract_label)
         assert api.stix_cyber_observable.remove_label(id=child["id"], label_id=label["id"])
-        assert contract_label not in label_values(api.stix_cyber_observable.read(id=child["id"]))
+        wait_for_label(api, child["id"], contract_label, present=False)
 
         connector = IocTrustClusterConnector()
-        # The contract is for trust edges/labels; avoid leaving an audit Note fixture.
+        # The contract is for trust edges/labels; avoid leaving audit Note fixtures.
         connector._create_audit_note = lambda *args, **kwargs: None
-        result = connector.process_message({"entity_id": child["id"], "entity_type": "Domain-Name"})
-        refreshed = api.stix_cyber_observable.read(id=child["id"])
-        labels = label_values(refreshed)
-        assert f"{CLUSTER_LABEL_PREFIX}:{parent_value}" not in labels
-        assert LABEL_INHERITED_MALICIOUS_CASCADE in labels
-        assert "malicious-cascade" in result
 
-        print("ok: OpenCTI trust-edge contract passed")
+        benign_result = connector.process_message(
+            {"entity_id": benign_child["id"], "entity_type": "Domain-Name"}
+        )
+        benign_labels = label_values(wait_for_label(
+            api, benign_child["id"], LABEL_INHERITED_FP_CANDIDATE
+        ))
+        assert LABEL_INHERITED_FP_CANDIDATE in benign_labels, benign_result
+        assert "fp-candidate inherited" in benign_result
+
+        malicious_result = connector.process_message(
+            {"entity_id": child["id"], "entity_type": "Domain-Name"}
+        )
+        malicious_labels = label_values(wait_for_label(
+            api, child["id"], LABEL_INHERITED_MALICIOUS_CASCADE
+        ))
+        assert f"{CLUSTER_LABEL_PREFIX}:{parent_value}" not in malicious_labels
+        assert LABEL_INHERITED_MALICIOUS_CASCADE in malicious_labels
+        assert LABEL_INHERITED_FP_CANDIDATE not in malicious_labels
+        assert "malicious-cascade" in malicious_result
+
+        print("ok: OpenCTI trust-edge and trust-state contracts passed")
     finally:
+        if connector is not None:
+            connector.helper.stop()
         if keep:
             print(f"kept fixtures: {', '.join(obs_ids)}")
             return
@@ -146,6 +197,11 @@ def main() -> None:
         for obs_id in reversed(obs_ids):
             try:
                 api.stix_cyber_observable.delete(id=obs_id)
+            except Exception:
+                pass
+        if contract_label_id:
+            try:
+                api.label.delete(id=contract_label_id)
             except Exception:
                 pass
 

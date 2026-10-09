@@ -16,6 +16,20 @@ DNS NS parent discovery is opt-in (`TRUST_CLUSTER_USE_NS_LOOKUP=true` or `TRUST_
 
 The feed label `sinkhole` and the connector label `sinkholed` are compatibility aliases. Either is a direct malicious assessment regardless of score and drives the same one-hop verdict fanout. The connector creates only the canonical `sinkholed` spelling and does not add it when either alias is already present.
 
+## Trust-state activation workflow
+
+Direct assessments are inputs:
+
+- An analyst or trusted feed applies `fp-confirmed` to a parent that is known benign.
+- A feed may apply `sinkhole`; the connector applies `sinkholed` when DNS resolves to a configured sinkhole IP.
+- A parent score at or above `TRUST_CLUSTER_MALICIOUS_SCORE_MIN` (default `70`) is a direct malicious assessment unless the parent itself carries an inherited cascade label.
+
+The connector alone owns the inherited outputs `trust-cluster:fp-candidate` and `trust-cluster:malicious-cascade`. Analysts and feeds should not apply those labels directly. Generic unnamespaced `fp-candidate` and `malicious-cascade` labels are legacy/manual state and are not automatically removed.
+
+Propagation requires a connector-owned child→parent `related-to` relationship. Only real `IPv4-Addr`, `IPv6-Addr`, and `Domain-Name` parents participate; label-only ASN/JA4 groups do not. A benign parent must carry `fp-confirmed` and remain below the malicious threshold. Its child must be at or below `TRUST_CLUSTER_FP_CASCADE_SCORE_MAX` (default `50`), below the malicious threshold, and have no malicious cascade label or linked high-score Indicator. A directly malicious or sinkhole parent applies inherited malicious state to each direct child. Unknown and inherited-only parents do not fan out, and propagation is one hop.
+
+Zero assignments are therefore valid when no parent has a direct assessment, no eligible child relationship exists, or the connector has not received a parent/child update event.
+
 ## Optional OpenCTI contract smoke test
 
 The fast unit tests stay mocked and Docker-free. To verify the real compose OpenCTI API accepts the trust-edge contract, run the opt-in smoke test against a running stack:
@@ -26,7 +40,7 @@ export OPENCTI_TOKEN=<admin/api token>
 python3 connectors/ioc-trust-cluster/scripts/opencti_trust_edge_contract.py
 ```
 
-Optional: set `CONNECTOR_ID` to the connector UUID and `TRUST_CONTRACT_KEEP=1` to keep the temporary observables for inspection. The script creates child→parent `related-to` trust edges, forces pycti pagination with `first=1,getAll=True`, adds/removes a connector-owned label, and calls `process_message` on the child.
+Optional: set `CONNECTOR_ID` to the connector UUID and `TRUST_CONTRACT_KEEP=1` to keep the temporary observables for inspection. Without that flag, the script uses randomized temporary Observables and removes them and their relationships afterward; it does not alter existing IOC verdicts. It verifies both an `fp-confirmed` parent→eligible-child transition and a directly malicious parent→child transition, forces pycti pagination with `first=1,getAll=True`, and checks connector-owned label add/remove behavior.
 
 ## CIDR parent rule
 
