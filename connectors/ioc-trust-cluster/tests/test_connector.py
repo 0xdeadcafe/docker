@@ -63,9 +63,11 @@ from connector import (
     LABEL_MALICIOUS_CASCADE,
     LABEL_INHERITED_FP_CANDIDATE,
     LABEL_INHERITED_MALICIOUS_CASCADE,
+    LABEL_SINKHOLE,
     LABEL_SINKHOLED,
     LABEL_ONLY,
     CLUSTER_LABEL_PREFIX,
+    ASN_REL_DESCRIPTION,
     COLOR_CLUSTER,
     COLOR_FP,
     COLOR_MALICIOUS,
@@ -266,16 +268,17 @@ class TestClassifyParent:
     def test_zero_score_is_unknown(self):
         assert self.c._classify_parent(0, set()) == "UNKNOWN"
 
-    def test_sinkholed_label_is_confirmed_malicious_regardless_of_score(self):
-        """sinkholed parent is a direct assessment — score doesn't matter."""
-        assert self.c._classify_parent(0,  {LABEL_SINKHOLED}) == "CONFIRMED_MALICIOUS"
-        assert self.c._classify_parent(30, {LABEL_SINKHOLED}) == "CONFIRMED_MALICIOUS"
-        assert self.c._classify_parent(80, {LABEL_SINKHOLED}) == "CONFIRMED_MALICIOUS"
+    @pytest.mark.parametrize("label", [LABEL_SINKHOLE, LABEL_SINKHOLED])
+    @pytest.mark.parametrize("score", [0, 30, 80])
+    def test_sinkhole_labels_are_confirmed_malicious_regardless_of_score(
+        self, label, score
+    ):
+        assert self.c._classify_parent(score, {label}) == "CONFIRMED_MALICIOUS"
 
-    def test_sinkholed_with_malicious_cascade_is_still_confirmed_malicious(self):
-        """sinkholed takes precedence even when malicious-cascade is also set."""
+    @pytest.mark.parametrize("label", [LABEL_SINKHOLE, LABEL_SINKHOLED])
+    def test_sinkhole_labels_override_malicious_cascade(self, label):
         assert self.c._classify_parent(
-            30, {LABEL_SINKHOLED, LABEL_MALICIOUS_CASCADE}
+            30, {label, LABEL_MALICIOUS_CASCADE}
         ) == "CONFIRMED_MALICIOUS"
 
 
@@ -351,6 +354,122 @@ class TestExtractParentIPv6:
         c2._get_announced_cidr = MagicMock(return_value="2001:db8::/32")
         p = c2._extract_parent("IPv6-Addr", "2001:db8::1")
         assert p == ("IPv6-Addr", "2001:db8::/32")
+
+
+class TestKnownCidrAnchors:
+    """Trusted CIDR→ASN edges avoid repeated RDAP for peer addresses."""
+
+    @staticmethod
+    def _asn_rel(
+        cidr: str,
+        entity_type: str = "IPv4-Addr",
+        description: str = ASN_REL_DESCRIPTION,
+        target_type: str = "Autonomous-System",
+    ) -> dict:
+        return {
+            "description": description,
+            "from": {
+                "id": f"cidr-{cidr}",
+                "entity_type": entity_type,
+                "observable_value": cidr,
+            },
+            "to": {"id": "asn-1", "entity_type": target_type},
+        }
+
+    def test_loads_only_connector_owned_asn_backed_cidrs_and_uses_longest_prefix(self):
+        c = _make_connector({"TRUST_CLUSTER_USE_RDAP": "true"})
+        c.helper.api.stix_core_relationship.list.return_value = [
+            self._asn_rel("8.8.0.0/16"),
+            self._asn_rel("8.8.8.0/24"),
+            self._asn_rel("8.8.8.0/25", description="analyst-created edge"),
+            self._asn_rel("8.8.8.0/26", target_type="Organization"),
+        ]
+        c._get_announced_cidr = MagicMock(return_value="9.9.9.0/24")
+
+        assert c._extract_parent("IPv4-Addr", "8.8.8.8") == (
+            "IPv4-Addr", "8.8.8.0/24"
+        )
+        assert c._extract_parent("IPv4-Addr", "8.8.8.9") == (
+            "IPv4-Addr", "8.8.8.0/24"
+        )
+
+        c._get_announced_cidr.assert_not_called()
+        c.helper.api.stix_core_relationship.list.assert_called_once_with(
+            relationship_type="belongs-to",
+            fromTypes=["IPv4-Addr", "IPv6-Addr"],
+            toTypes=["Autonomous-System"],
+            search=ASN_REL_DESCRIPTION,
+            getAll=True,
+        )
+
+    def test_ipv6_longest_prefix_match_skips_rdap(self):
+        c = _make_connector({"TRUST_CLUSTER_USE_RDAP": "true"})
+        c.helper.api.stix_core_relationship.list.return_value = [
+            self._asn_rel("2606:4700::/32", "IPv6-Addr"),
+            self._asn_rel("2606:4700:4700::/48", "IPv6-Addr"),
+        ]
+        c._get_announced_cidr = MagicMock(return_value=None)
+
+        assert c._extract_parent("IPv6-Addr", "2606:4700:4700::1111") == (
+            "IPv6-Addr", "2606:4700:4700::/48"
+        )
+        c._get_announced_cidr.assert_not_called()
+
+    def test_untrusted_cidr_is_ignored_and_rdap_handles_miss(self):
+        c = _make_connector({"TRUST_CLUSTER_USE_RDAP": "true"})
+        c.helper.api.stix_core_relationship.list.return_value = [
+            self._asn_rel("8.8.8.0/24", description="feed relationship")
+        ]
+        c._get_announced_cidr = MagicMock(return_value="8.8.0.0/16")
+
+        assert c._extract_parent("IPv4-Addr", "8.8.8.8") == (
+            "IPv4-Addr", "8.8.0.0/16"
+        )
+        c._get_announced_cidr.assert_called_once_with("8.8.8.8")
+
+    def test_successful_cidr_asn_link_indexes_chain_for_peer_ip(self):
+        c = _make_connector({"TRUST_CLUSTER_USE_RDAP": "true"})
+        c._known_cidrs_loaded = True
+        c._get_announced_cidr = MagicMock(return_value="8.8.8.0/24")
+        cidr = _obs(entity_id="cidr-001", value="8.8.8.0/24")
+        asn = _obs(
+            entity_id="as-15169",
+            entity_type="Autonomous-System",
+            value="AS15169",
+        )
+        c.helper.api.stix_cyber_observable.list.return_value = [asn]
+        c.helper.api.stix_core_relationship.list.return_value = []
+
+        first = c._extract_parent("IPv4-Addr", "8.8.8.8")
+        c._cidr_asn_cache["8.8.8.0/24"] = ("15169", "GOOGLE LLC")
+        assert c._ensure_cidr_asn_relationship(cidr, "8.8.8.0/24") is True
+        second = c._extract_parent("IPv4-Addr", "8.8.8.9")
+
+        assert first == second == ("IPv4-Addr", "8.8.8.0/24")
+        c._get_announced_cidr.assert_called_once_with("8.8.8.8")
+        c.helper.api.stix_core_relationship.create.assert_called_once_with(
+            fromId="cidr-001",
+            toId="as-15169",
+            relationship_type="belongs-to",
+            description=ASN_REL_DESCRIPTION,
+            confidence=75,
+        )
+
+    def test_private_address_does_not_use_index_or_rdap(self):
+        c = _make_connector({"TRUST_CLUSTER_USE_RDAP": "true"})
+        c._known_cidrs_loaded = True
+        assert c._register_known_cidr("10.0.0.0/8") is True
+        with patch.object(_mod, "IPWhois") as mock_cls:
+            assert c._extract_parent("IPv4-Addr", "10.1.2.3") is None
+        mock_cls.assert_not_called()
+
+    def test_index_is_bounded(self):
+        c = _make_connector()
+        with patch.object(_mod, "_CACHE_MAXSIZE", 1):
+            assert c._register_known_cidr("8.8.8.0/24") is True
+            assert c._register_known_cidr("1.1.1.0/24") is False
+        assert len(c._known_cidr_anchors) == 1
+        c.helper.log_warning.assert_called_once()
 
 
 class TestExtractParentDomain:
@@ -2195,6 +2314,7 @@ class TestRelationshipSourceOfTruth:
         c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
 
         c._get_announced_cidr.assert_not_called()
+        assert c._known_cidrs_loaded is False
         c.helper.api.stix_cyber_observable.create.assert_not_called()
 
     def test_stale_label_existing_parent_recreates_relationship(self):
@@ -2536,6 +2656,7 @@ class TestSinkhole:
         result = c.process_message({"entity_id": "obs-001", "entity_type": "Domain-Name"})
 
         assert LABEL_SINKHOLED in _labels_created(c.helper)
+        assert LABEL_SINKHOLE not in _labels_created(c.helper)
         assert "sinkholed" in result
         assert SINKHOLE_IP in result
 
@@ -2569,16 +2690,18 @@ class TestSinkhole:
 
         c._get_resolved_ips.assert_not_called()
 
-    def test_already_sinkholed_no_duplicate_lookup(self):
-        """Label already present — A record must not be re-queried."""
+    @pytest.mark.parametrize("label", [LABEL_SINKHOLE, LABEL_SINKHOLED])
+    def test_existing_sinkhole_alias_prevents_duplicate(self, label):
+        """Either spelling prevents DNS work and creation of the other alias."""
         c = self._con()
         c._get_resolved_ips = MagicMock()
         child = _obs(entity_type="Domain-Name", value="evil.com",
-                     score=50, labels=[LABEL_SINKHOLED])
+                     score=50, labels=[label])
         _wire(c, child)
         c.process_message({"entity_id": "obs-001", "entity_type": "Domain-Name"})
 
         c._get_resolved_ips.assert_not_called()
+        assert not ({LABEL_SINKHOLE, LABEL_SINKHOLED} & set(_labels_created(c.helper)))
 
     def test_ipv4_type_not_checked(self):
         """Sinkhole check is Domain-Name only."""
@@ -2605,15 +2728,13 @@ class TestSinkhole:
 
     # ── cascade ───────────────────────────────────────────────────────────────
 
-    def test_sinkholed_parent_cascades_malicious_to_child(self):
-        """
-        Subdomain whose parent carries 'sinkholed' must inherit
-        malicious-cascade even when parent score is below malicious_score_min.
-        """
+    @pytest.mark.parametrize("label", [LABEL_SINKHOLE, LABEL_SINKHOLED])
+    def test_sinkhole_parent_cascades_malicious_to_child(self, label):
+        """Either spelling drives one-hop cascade despite a low parent score."""
         c = _make_connector({"TRUST_CLUSTER_USE_NS_LOOKUP": "false"})
         child  = _obs(entity_type="Domain-Name", value="cdn.evil.com",  score=50)
         parent = _obs(entity_id="root-001",      entity_type="Domain-Name",
-                      value="evil.com", score=20, labels=[LABEL_SINKHOLED])
+                      value="evil.com", score=20, labels=[label])
         _wire(c, child, parent)
 
         c.process_message({"entity_id": "obs-001", "entity_type": "Domain-Name"})

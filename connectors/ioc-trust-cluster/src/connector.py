@@ -96,7 +96,9 @@ _tld = tldextract.TLDExtract(suffix_list_urls=None)
 LABEL_FP_CANDIDATE      = "fp-candidate"          # heuristic/candidate benign signal
 LABEL_FP_CONFIRMED      = "fp-confirmed"          # explicit benign signal allowed to cascade
 LABEL_MALICIOUS_CASCADE = "malicious-cascade"     # legacy/manual malicious state
-LABEL_SINKHOLED         = "sinkholed"
+LABEL_SINKHOLE          = "sinkhole"               # feed compatibility alias
+LABEL_SINKHOLED         = "sinkholed"              # canonical connector-created label
+SINKHOLE_LABELS         = frozenset({LABEL_SINKHOLE, LABEL_SINKHOLED})
 CLUSTER_LABEL_PREFIX    = "trust-cluster"
 LABEL_INHERITED_FP_CANDIDATE      = f"{CLUSTER_LABEL_PREFIX}:fp-candidate"
 LABEL_INHERITED_MALICIOUS_CASCADE = f"{CLUSTER_LABEL_PREFIX}:malicious-cascade"
@@ -207,8 +209,14 @@ class IocTrustClusterConnector:
         self._stats: dict[str, int] = IocTrustClusterConnector._reset_stats()
 
         # Session caches — avoid redundant network calls for the same address / domain
-        self._cidr_cache: dict[str, str | None] = {}   # ip_str → CIDR string
+        self._cidr_cache: dict[str, str | None] = {}   # ip_str → RDAP CIDR string
         self._cidr_asn_cache: dict[str, tuple[str, str | None]] = {}  # CIDR → (ASN, owner)
+        # Connector-owned CIDR→ASN edges form a bounded, per-session prefix
+        # index. A peer IP can reuse the known chain without another RDAP call.
+        self._known_cidr_anchors: set[ipaddress.IPv4Network | ipaddress.IPv6Network] = set()
+        self._known_cidr_prefixes: dict[int, set[int]] = {4: set(), 6: set()}
+        self._known_cidrs_loaded = False
+        self._known_cidr_limit_warned = False
         self._asn_desc_cache: dict[str, str | None] = {}  # "AS{n}" → owner name
         self._ns_cache: dict[str, str | None] = {}     # domain → primary NS hostname
         self._ip_cache: dict[str, list[str]] = {}      # domain → A record IP list
@@ -285,6 +293,76 @@ class IocTrustClusterConnector:
             return []
 
     # ── RDAP helpers ──────────────────────────────────────────────────────────────────────
+
+    def _register_known_cidr(self, cidr: str) -> bool:
+        """Add one trusted CIDR anchor to the bounded session prefix index."""
+        try:
+            if "/" not in cidr:
+                return False
+            network = ipaddress.ip_network(cidr, strict=False)
+        except ValueError:
+            return False
+        if network in self._known_cidr_anchors:
+            return True
+        if len(self._known_cidr_anchors) >= _CACHE_MAXSIZE:
+            if not self._known_cidr_limit_warned:
+                self.helper.log_warning(
+                    f"[trust-cluster] known CIDR index limit reached ({_CACHE_MAXSIZE}); "
+                    "additional anchors will use RDAP"
+                )
+                self._known_cidr_limit_warned = True
+            return False
+        self._known_cidr_anchors.add(network)
+        self._known_cidr_prefixes[network.version].add(network.prefixlen)
+        return True
+
+    def _load_known_cidr_anchors(self) -> None:
+        """Load connector-owned, ASN-backed CIDRs once per connector session."""
+        if self._known_cidrs_loaded:
+            return
+        self._known_cidrs_loaded = True
+        try:
+            rels = self.helper.api.stix_core_relationship.list(
+                relationship_type="belongs-to",
+                fromTypes=["IPv4-Addr", "IPv6-Addr"],
+                toTypes=["Autonomous-System"],
+                search=ASN_REL_DESCRIPTION,
+                getAll=True,
+            ) or []
+            for rel in rels:
+                if ASN_REL_DESCRIPTION not in (rel.get("description") or ""):
+                    continue
+                source = rel.get("from") or rel.get("fromEntity") or {}
+                target = rel.get("to") or rel.get("toEntity") or {}
+                if str(target.get("entity_type") or target.get("type") or "").lower() != "autonomous-system":
+                    continue
+                info = self._parent_info_from_observable(source)
+                if info and info[0] in {"IPv4-Addr", "IPv6-Addr"}:
+                    self._register_known_cidr(info[1])
+            self.helper.log_info(
+                f"[trust-cluster] loaded {len(self._known_cidr_anchors)} "
+                "connector-owned ASN-backed CIDR anchor(s)"
+            )
+        except Exception as exc:
+            self.helper.log_warning(
+                f"[trust-cluster] known CIDR index load failed; using RDAP: {exc}"
+            )
+
+    def _match_known_cidr(self, ip_str: str) -> str | None:
+        """Return the most-specific trusted CIDR containing a public IP."""
+        try:
+            addr = ipaddress.ip_address(ip_str)
+            if (addr.is_private or addr.is_loopback or addr.is_link_local
+                    or addr.is_reserved or addr.is_multicast or addr.is_unspecified):
+                return None
+        except ValueError:
+            return None
+        self._load_known_cidr_anchors()
+        for prefixlen in sorted(self._known_cidr_prefixes[addr.version], reverse=True):
+            candidate = ipaddress.ip_network((addr, prefixlen), strict=False)
+            if candidate in self._known_cidr_anchors:
+                return str(candidate)
+        return None
 
     def _get_announced_cidr(self, ip_str: str) -> str | None:
         """
@@ -510,7 +588,7 @@ class IocTrustClusterConnector:
                 if "/" in value:
                     return None
                 if self.use_rdap:
-                    announced = self._get_announced_cidr(host)
+                    announced = self._match_known_cidr(host) or self._get_announced_cidr(host)
                     if announced and announced != value:
                         return ("IPv4-Addr", announced)
                 return None
@@ -529,7 +607,7 @@ class IocTrustClusterConnector:
                 except ValueError:
                     return None
                 if self.use_rdap:
-                    announced = self._get_announced_cidr(host)
+                    announced = self._match_known_cidr(host) or self._get_announced_cidr(host)
                     if announced and announced != value:
                         return ("IPv6-Addr", announced)
                 return None
@@ -631,7 +709,7 @@ class IocTrustClusterConnector:
             "malicious-cascade" (it was itself a cascade recipient, not directly
             assessed).  UNKNOWN propagation stops in BOTH directions.
         """
-        if LABEL_SINKHOLED in p_labels:
+        if self._has_sinkhole_label(p_labels):
             return "CONFIRMED_MALICIOUS"
         if p_score >= self.malicious_score_min and not self._has_malicious_cascade_label(p_labels):
             return "CONFIRMED_MALICIOUS"
@@ -672,6 +750,10 @@ class IocTrustClusterConnector:
     @staticmethod
     def _has_fp_candidate_label(labels: set) -> bool:
         return bool({LABEL_FP_CANDIDATE, LABEL_INHERITED_FP_CANDIDATE} & labels)
+
+    @staticmethod
+    def _has_sinkhole_label(labels: set) -> bool:
+        return bool(SINKHOLE_LABELS & labels)
 
     @staticmethod
     def _has_malicious_cascade_label(labels: set) -> bool:
@@ -986,9 +1068,12 @@ class IocTrustClusterConnector:
         asn_obs = self._find_or_create_asn(asn, owner)
         if not asn_obs:
             return False
-        return self._ensure_core_relationship(
+        linked = self._ensure_core_relationship(
             cidr_parent["id"], asn_obs["id"], "belongs-to", ASN_REL_DESCRIPTION
         )
+        if linked:
+            self._register_known_cidr(cidr_value)
+        return linked
 
     def _get_sightings_count(self, entity_id: str) -> int:
         try:
@@ -1323,7 +1408,7 @@ class IocTrustClusterConnector:
         if (
             entity_type in ("Domain-Name", "Url")
             and self.sinkhole_ips
-            and LABEL_SINKHOLED not in labels
+            and not self._has_sinkhole_label(labels)
         ):
             # For URLs extract the hostname; for Domain-Name use the value directly.
             lookup_host = (
@@ -1399,6 +1484,8 @@ class IocTrustClusterConnector:
         return result
 
     def run(self):
+        if self.use_rdap:
+            self._load_known_cidr_anchors()
         self.helper.listen(self.process_message)
 
 
