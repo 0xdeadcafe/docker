@@ -1,582 +1,437 @@
 #!/usr/bin/env python3
-"""
-Vectra Metadata False-Positive Discovery — OpenCTI External Import Connector
-
-Periodically executes 6 Vectra Metadata SQL queries that identify network
-endpoints (IPs, domains) observed across a BROAD SET of internal hosts.
-High host-breadth is a strong signal for benign infrastructure (CDN, SaaS,
-OS telemetry, corporate proxies) and a direct analogue of the ubiquity
-heuristic in the ioc-trust-cluster connector.
-
-Each discovered observable (new or existing) is labelled in OpenCTI with:
-  - Labels: vectra-metadata-benign or vectra-metadata-popular-ip, breadth:<tier>
-    Raw Q1 broad-reach IPs get the weaker popular-ip label by default; stronger
-    domain/M365 signals get vectra-metadata-benign. The cascade-capable
-    fp-candidate label is opt-in via VECTRA_FP_APPLY_FP_CANDIDATE=true.
-  - x_opencti_score = VECTRA_FP_SCORE (default 15) is set only when the
-    connector creates a new observable; existing scores are never overwritten.
-  - A Note with the metadata context is attached whenever the source label is
-    newly applied — whether the observable is brand-new or pre-existing.
-  - breadth:<tier> is refreshed when the observable moves to a higher tier;
-    previous tier labels are retained for audit history.
-
-Safety guard: if an observable already exists with score ≥
-VECTRA_FP_MALICIOUS_GUARD_SCORE (default 70) — i.e. a feed connector has
-independently confirmed it as malicious — the connector does NOT apply benign
-labels to it.
-
-Integration with ioc-trust-cluster: Vectra labels are source context by default.
-Only opt-in fp-candidate/explicit confirmed labels should feed cascade behavior.
-
-The 6 queries (all Trino SQL against Vectra Metadata):
-
-  Q1 broad_reach_ips       External IPs contacted by ≥N distinct hosts     (network.isession)
-  Q2 broad_reach_dns       Domains resolved by ≥N distinct hosts            (network.dns)
-  Q3 broad_reach_tls_sni   TLS SNI names seen from ≥N distinct hosts        (network.ssl)
-  Q4 broad_reach_http      HTTP hosts seen by ≥N hosts, majority success     (network.http)
-  Q5 benign_beacons        Vectra-ML non-C2 beacon destinations, ≥N hosts   (network.beacon)
-  Q6 shared_auth_ips       IPs used for M365 auth by ≥N distinct users      (m365.signins)
-"""
-
+"""OpenCTI connector for privacy-safe Vectra endpoint commonness evidence."""
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import time
 import traceback
+import uuid
+from collections import defaultdict
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Iterable
 
 from pycti import OpenCTIConnectorHelper
 
-from metadata_client import VectraMetadataClient, VectraMetadataError
-from queries import ALL_QUERIES, IOCEntry, QueryDefinition
+from metadata_client import QueryResult, VectraMetadataClient, VectraMetadataError
+from queries import (
+    BATCH_SIZE, DISCOVERY_LIMIT, DISCOVERY_QUERIES, QUERY_BY_NAME,
+    TARGETED_QUERIES, Observation, batches, build_windows,
+    normalize_domain, normalize_ipv4,
+)
+
+LABEL_COMMON_DOMAIN = "vectra-metadata:common-domain"
+LABEL_COMMON_IP = "vectra-metadata:common-ip"
+LABEL_SHARED_AUTH_IP = "vectra-metadata:shared-auth-ip"
+LABEL_CONFLICT = "vectra-metadata:commonness-conflict"
+OWNED_LABELS = {LABEL_COMMON_DOMAIN, LABEL_COMMON_IP, LABEL_SHARED_AUTH_IP, LABEL_CONFLICT}
+LABEL_COLORS = {
+    LABEL_COMMON_DOMAIN: "#1565c0", LABEL_COMMON_IP: "#6d4c41",
+    LABEL_SHARED_AUTH_IP: "#00838f", LABEL_CONFLICT: "#b71c1c",
+}
+NOTE_NAMESPACE = uuid.UUID("4c47e958-57d3-4dc4-af4b-0ac7758b0eac")
+QUERY_VERSION = "x39.1-commonness-v1"
 
 
-# ─── constants ────────────────────────────────────────────────────────────────
-
-LABEL_FP_CANDIDATE = "fp-candidate"
-LABEL_VECTRA_BENIGN = "vectra-metadata-benign"
-LABEL_VECTRA_POPULAR_IP = "vectra-metadata-popular-ip"
-
-COLOR_FP = "#2e7d32"         # green  — benign / fp candidate
-COLOR_VECTRA = "#0d47a1"     # dark blue — vectra-sourced
-COLOR_POPULAR_IP = "#6d4c41" # brown — weak popularity context
-COLOR_BREADTH = "#455a64"    # blue-grey — breadth tier
-
-# Context keys already captured in the note header — skip in the detail table.
-_CTX_SKIP = frozenset({
-    'resp_ip', 'ip_address', 'domain', 'server_name', 'host', 'resp_domains',
-    '_matched_queries', '_query_labels', '_context_count',
-})
+def _bool(name: str, default: bool = False) -> bool:
+    return os.environ.get(name, str(default)).strip().lower() in {"1", "true", "yes"}
 
 
-# ─── connector ────────────────────────────────────────────────────────────────
+def _labels(entity: dict) -> set[str]:
+    return {str(item.get("value") or "").lower() for item in entity.get("objectLabel") or []}
 
-class VectraMetadataFPConnector:
 
+def _is_conflict(entity: dict) -> bool:
+    labels = _labels(entity)
+    threat_label = any(any(word in label for word in ("malicious", "malware", "sinkhol", "threat"))
+                       for label in labels if label != "trust-cluster:malicious-cascade")
+    return (
+        int(entity.get("x_opencti_score") or 0) >= 70
+        or threat_label
+        or "trust-cluster:malicious-cascade" in labels
+        or bool((entity.get("indicators") or {}).get("edges"))
+    )
+
+
+@dataclass
+class EvidencePlan:
+    observable_type: str
+    value: str
+    observations: list[Observation]
+    discovery: bool = False
+    entity: dict | None = None
+
+    @property
+    def qualifying_signals(self) -> set[str]:
+        grouped: dict[str, set[str]] = defaultdict(set)
+        for observation in self.observations:
+            if observation.breadth >= QUERY_BY_NAME[observation.signal].threshold:
+                grouped[observation.signal].add(observation.window_id)
+        return {signal for signal, windows in grouped.items() if len(windows) >= 2}
+
+    @property
+    def qualifies(self) -> bool:
+        return bool(self.qualifying_signals)
+
+
+class VectraMetadataCommonnessConnector:
     def __init__(self) -> None:
-        _conf = int(os.environ.get("VECTRA_FP_CONFIDENCE", "60"))
+        if _bool("VECTRA_FP_APPLY_FP_CANDIDATE") or _bool("VECTRA_FP_STRONG_RAW_IPS"):
+            raise ValueError("legacy benign/fp promotion flags are no longer supported")
         config = {
-            "opencti": {
-                "url":   os.environ.get("OPENCTI_URL",   "http://opencti:8080"),
-                "token": os.environ.get("OPENCTI_TOKEN"),
-            },
+            "opencti": {"url": os.environ.get("OPENCTI_URL", "http://opencti:8080"),
+                        "token": os.environ.get("OPENCTI_TOKEN")},
             "connector": {
-                "id":               os.environ.get("CONNECTOR_ID"),
-                "type":             "EXTERNAL_IMPORT",
-                "name":             os.environ.get(
-                                        "CONNECTOR_NAME",
-                                        "Vectra Metadata FP Discovery"
-                                    ),
-                "scope":            "IPv4-Addr,Domain-Name",
-                "auto":             os.environ.get(
-                                        "CONNECTOR_AUTO", "true"
-                                    ).lower() == "true",
-                "confidence_level": _conf,
-                "log_level":        os.environ.get(
-                                        "CONNECTOR_LOG_LEVEL", "info"
-                                    ),
-                "only_contextual":  False,
+                "id": os.environ.get("CONNECTOR_ID"), "type": "EXTERNAL_IMPORT",
+                "name": os.environ.get("CONNECTOR_NAME", "Vectra Metadata Commonness"),
+                "scope": "IPv4-Addr,Domain-Name", "auto": True,
+                "confidence_level": int(os.environ.get("CONNECTOR_CONFIDENCE_LEVEL", "60")),
+                "log_level": os.environ.get("CONNECTOR_LOG_LEVEL", "info"),
+                "only_contextual": False,
             },
         }
         self.helper = OpenCTIConnectorHelper(config)
-
-        # ── query parameters ───────────────────────────────────────────────
-        self.lookback_days: int    = int(os.environ.get("VECTRA_FP_LOOKBACK_DAYS",          "30"))
-        self.host_threshold: int   = int(os.environ.get("VECTRA_FP_HOST_BREADTH_THRESHOLD", "10"))
-        self.user_threshold: int   = int(os.environ.get("VECTRA_FP_USER_BREADTH_THRESHOLD", "20"))
-        if self.host_threshold < 2:
-            raise ValueError(
-                f"VECTRA_FP_HOST_BREADTH_THRESHOLD={self.host_threshold} is dangerously low "
-                "(minimum 2, default 10). A threshold of 0 or 1 matches nearly every "
-                "external endpoint and would mark all of them fp-candidate."
-            )
-        if self.user_threshold < 2:
-            raise ValueError(
-                f"VECTRA_FP_USER_BREADTH_THRESHOLD={self.user_threshold} is dangerously low "
-                "(minimum 2, default 20)."
-            )
-        self.max_results: int      = int(os.environ.get("VECTRA_FP_MAX_RESULTS",            "500"))
-        self.interval_sec: int     = int(os.environ.get("VECTRA_FP_INTERVAL_SEC",           "86400"))
-        # Seconds to sleep between consecutive queries within a cycle.
-        # Avoids hammering the Vectra metadata cluster when all 6 queries fire
-        # back-to-back; also staggers load if the cluster is already under pressure.
-        self.inter_query_delay_sec: int = int(os.environ.get(
-                                        "VECTRA_FP_INTER_QUERY_DELAY_SEC", "2"
-                                    ))
-
-        # ── import scoring / safety ────────────────────────────────────────
-        self.fp_score: int          = int(os.environ.get("VECTRA_FP_SCORE",                "15"))
-        self.confidence: int        = _conf
-        self.malicious_guard: int   = int(os.environ.get("VECTRA_FP_MALICIOUS_GUARD_SCORE","70"))
-        self.apply_fp_candidate: bool = os.environ.get(
-                                        "VECTRA_FP_APPLY_FP_CANDIDATE", "false"
-                                    ).lower() == "true"
-        self.create_missing: bool     = os.environ.get(
-                                        "VECTRA_FP_CREATE_MISSING", "true"
-                                    ).lower() == "true"
-        self.strong_raw_ips: bool     = os.environ.get(
-                                        "VECTRA_FP_STRONG_RAW_IPS", "false"
-                                    ).lower() == "true"
-        self._skipped_missing: int    = 0
-
-        # ── Vectra metadata client (lazy — created in run()) ───────────────
+        # pycti logs filter values at INFO; targeted observable lookups would leak
+        # endpoint values into connector logs. Keep API warnings/errors, but silence
+        # only that verbose channel. Connector aggregate logs remain enabled.
+        if getattr(getattr(self.helper, "api", None), "app_logger", None):
+            self.helper.api.app_logger.info = lambda *_args, **_kwargs: None
+        self.source_id = os.environ.get("VECTRA_COMMONNESS_SOURCE_ID", "tenant-01").strip()
+        if not self.source_id or len(self.source_id) > 64 or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for c in self.source_id):
+            raise ValueError("VECTRA_COMMONNESS_SOURCE_ID must be an opaque 1-64 character ID")
+        self.write_enabled = _bool("VECTRA_COMMONNESS_WRITE", False)
+        self.lookback_days = int(os.environ.get("VECTRA_COMMONNESS_LOOKBACK_DAYS", "30"))
+        self.batch_size = int(os.environ.get("VECTRA_COMMONNESS_BATCH_SIZE", str(BATCH_SIZE)))
+        self.page_size = int(os.environ.get("VECTRA_COMMONNESS_PAGE_SIZE", "100"))
+        self.discovery_limit = int(os.environ.get("VECTRA_COMMONNESS_DISCOVERY_LIMIT", str(DISCOVERY_LIMIT)))
+        self.creation_limit = int(os.environ.get("VECTRA_COMMONNESS_CREATION_LIMIT", "100"))
+        self.interval_sec = int(os.environ.get("VECTRA_COMMONNESS_INTERVAL_SEC", "86400"))
+        if not 1 <= self.batch_size <= BATCH_SIZE:
+            raise ValueError(f"VECTRA_COMMONNESS_BATCH_SIZE must be 1-{BATCH_SIZE}")
+        if not 1 <= self.discovery_limit <= DISCOVERY_LIMIT:
+            raise ValueError(f"VECTRA_COMMONNESS_DISCOVERY_LIMIT must be 1-{DISCOVERY_LIMIT}")
+        if not 1 <= self.creation_limit <= 100:
+            raise ValueError("VECTRA_COMMONNESS_CREATION_LIMIT must be 1-100")
         self._client: VectraMetadataClient | None = None
-
-        # per-cycle dedup: avoid importing the same (type, value) twice
-        self._seen_this_cycle: set[tuple[str, str]] = set()
-
-    # ── metadata client factory ────────────────────────────────────────────────
+        self._cursors = {"Domain-Name": None, "IPv4-Addr": None}
+        self._wrapped = {"Domain-Name": False, "IPv4-Addr": False}
+        self._sweep_active: set[tuple[str, str]] = set()
+        self._sweep_complete = True
 
     def _build_client(self) -> VectraMetadataClient | None:
-        """Try to construct a VectraMetadataClient from env vars.
-
-        Returns None (and logs) if neither Cantina nor native config is present.
-        This lets the connector start without crashing even when Vectra is not
-        yet configured — it will sleep and retry each interval.
-        """
-        # OAuth2 token is cached on the client instance; reusing self._client
-        # across cycles avoids a token fetch on every run.
-        cantina_token    = os.environ.get("CANTINA_TOKEN", "").strip()
-        cantina_customer = os.environ.get("VECTRA_METADATA_CUSTOMER", "").strip()
-        ndr_url          = os.environ.get("VECTRA_NDR_URL", "").strip()
-        client_id        = os.environ.get("VECTRA_NDR_CLIENT_ID", "").strip()
-        client_secret    = os.environ.get("VECTRA_NDR_CLIENT_SECRET", "").strip()
-        ndr_token        = os.environ.get("VECTRA_NDR_TOKEN", "").strip()
-
-        cantina_ok = bool(cantina_token and cantina_customer)
-        native_ok  = bool(ndr_url and (ndr_token or (client_id and client_secret)))
-
-        if not cantina_ok and not native_ok:
-            self.helper.log_warning(
-                "[vectra-fp] Vectra metadata not configured — skipping this cycle.\n"
-                "  Cantina: set CANTINA_TOKEN + VECTRA_METADATA_CUSTOMER\n"
-                "  Native:  set VECTRA_NDR_URL + VECTRA_NDR_CLIENT_ID + "
-                "VECTRA_NDR_CLIENT_SECRET (or VECTRA_NDR_TOKEN)"
-            )
-            return None
-
         try:
-            client = VectraMetadataClient(
-                cantina_token    = cantina_token,
-                cantina_user     = os.environ.get("CANTINA_USER", "").strip(),
-                cantina_url      = os.environ.get(
-                                       "CANTINA_DARKSTAR_URL",
-                                       "https://cantina.vectra.ai/api/darkstar/lambda"
-                                   ).strip(),
-                cantina_customer = cantina_customer,
-                vectra_ndr_url   = ndr_url,
-                vectra_client_id = client_id,
-                vectra_client_secret = client_secret,
-                vectra_token     = ndr_token,
-                timeout_sec      = int(os.environ.get(
-                                       "VECTRA_FP_QUERY_TIMEOUT_SEC", "180"
-                                   )),
+            return VectraMetadataClient(
+                cantina_token=os.environ.get("CANTINA_TOKEN", ""),
+                cantina_user=os.environ.get("CANTINA_USER", ""),
+                cantina_url=os.environ.get("CANTINA_DARKSTAR_URL", "https://cantina.vectra.ai/api/darkstar/lambda"),
+                cantina_customer=os.environ.get("VECTRA_METADATA_CUSTOMER", ""),
+                vectra_ndr_url=os.environ.get("VECTRA_NDR_URL", ""),
+                vectra_client_id=os.environ.get("VECTRA_NDR_CLIENT_ID", ""),
+                vectra_client_secret=os.environ.get("VECTRA_NDR_CLIENT_SECRET", ""),
+                vectra_token=os.environ.get("VECTRA_NDR_TOKEN", ""),
+                timeout_sec=int(os.environ.get("VECTRA_COMMONNESS_QUERY_TIMEOUT_SEC", "180")),
+                poll_interval_sec=float(os.environ.get("VECTRA_METADATA_POLL_INTERVAL", "5")),
+                page_size=int(os.environ.get("VECTRA_METADATA_PAGE_SIZE", "1000")),
+                max_pages=int(os.environ.get("VECTRA_METADATA_MAX_PAGES", "200")),
+                max_retries=int(os.environ.get("VECTRA_METADATA_MAX_RETRIES", "2")),
             )
-            self.helper.log_info(
-                f"[vectra-fp] metadata client ready (mode={client.mode})"
-            )
-            return client
-        except VectraMetadataError as exc:
-            self.helper.log_error(f"[vectra-fp] metadata client init failed: {exc}")
+        except VectraMetadataError as exc:  # type: ignore[name-defined]
+            self.helper.log_warning(f"[vectra-commonness] Metadata disabled: {exc}")
             return None
-
-    # ── breadth bucketing ──────────────────────────────────────────────────────
 
     @staticmethod
-    def _breadth_bucket(n: int) -> str:
-        if n >= 500: return "500+"
-        if n >= 250: return "250-499"
-        if n >= 100: return "100-249"
-        if n >= 50:  return "50-99"
-        if n >= 20:  return "20-49"
-        if n >= 10:  return "10-19"
-        return "1-9"   # reachable only if host_threshold is lowered below 10
+    def _page_parts(page: object) -> tuple[list[dict], dict]:
+        if isinstance(page, dict):
+            entities = page.get("entities") or page.get("data") or []
+            pagination = page.get("pagination") or page.get("pageInfo") or {}
+            return list(entities), dict(pagination)
+        return list(page or []), {}
 
-    # ── OpenCTI observable helpers ─────────────────────────────────────────────
+    def _observable_page(self, observable_type: str) -> tuple[list[dict], bool]:
+        cursor = self._cursors[observable_type]
+        try:
+            raw = self.helper.api.stix_cyber_observable.list(
+                types=[observable_type], first=self.page_size, after=cursor,
+                orderBy="created_at", orderMode="asc", withPagination=True,
+                customAttributes="""
+                    id entity_type observable_value x_opencti_score
+                    objectLabel { id value }
+                    indicators(first: 1) { edges { node { id } } }
+                """,
+            )
+        except Exception as exc:
+            if cursor:
+                self.helper.log_warning(f"[vectra-commonness] invalid cursor for {observable_type}; restarting: {exc}")
+                self._cursors[observable_type] = None
+                return [], False
+            raise
+        entities, pagination = self._page_parts(raw)
+        has_next = bool(pagination.get("hasNextPage"))
+        self._cursors[observable_type] = pagination.get("endCursor") if has_next else None
+        wrapped = not has_next
+        self._wrapped[observable_type] |= wrapped
+        validator = normalize_domain if observable_type == "Domain-Name" else normalize_ipv4
+        valid = []
+        for entity in entities:
+            value = validator(entity.get("observable_value") or entity.get("value"))
+            if value:
+                entity = dict(entity)
+                entity["observable_value"] = value
+                valid.append(entity)
+        return valid, wrapped
+
+    def _execute(self, sql: str, signal: str, mode: str, metrics: dict) -> QueryResult:
+        assert self._client is not None
+        result = self._client.execute_result(sql)
+        metrics["queries"] += 1
+        metrics["runtime_seconds"] += result.runtime_seconds
+        metrics[result.status] += 1
+        if result.retry_count:
+            metrics["retries"] += result.retry_count
+        if not result.ok:
+            self.helper.log_warning(f"[vectra-commonness] {mode}/{signal}: {result.status} {result.error_kind}")
+        return result
+
+    def _targeted(self, entities: list[dict], windows, metrics: dict) -> tuple[list[Observation], bool]:
+        by_type = defaultdict(list)
+        for entity in entities:
+            by_type[entity["entity_type"]].append(entity["observable_value"])
+        observations: list[Observation] = []
+        complete = True
+        for query in TARGETED_QUERIES:
+            for chunk in batches(by_type[query.observable_type], self.batch_size):
+                result = self._execute(query.build_targeted(chunk, windows), query.name, "lookup", metrics)
+                if not result.ok:
+                    complete = False
+                    continue
+                observations.extend(query.observations(result.rows))
+        return observations, complete
+
+    def _discover(self, windows, metrics: dict) -> tuple[list[Observation], bool]:
+        observations: list[Observation] = []
+        complete = True
+        for query in DISCOVERY_QUERIES:
+            result = self._execute(query.build_discovery(windows, self.discovery_limit), query.name, "discovery", metrics)
+            if not result.ok:
+                complete = False
+                continue
+            observations.extend(query.observations(result.rows))
+        return observations, complete
 
     @staticmethod
-    def _query_names(entry: IOCEntry) -> set[str]:
-        raw = entry.context.get('_matched_queries') if isinstance(entry.context, dict) else None
-        if raw:
-            return {str(q) for q in raw}
-        return {q for q in str(entry.query_name).split(',') if q}
+    def _plans(observations: Iterable[Observation], discovery_keys: set[tuple[str, str]], entities: dict) -> dict[tuple[str, str], EvidencePlan]:
+        grouped: dict[tuple[str, str], list[Observation]] = defaultdict(list)
+        for observation in observations:
+            grouped[(observation.observable_type, observation.value)].append(observation)
+        return {key: EvidencePlan(key[0], key[1], rows, key in discovery_keys, entities.get(key))
+                for key, rows in grouped.items()}
 
-    def _source_labels(self, entry: IOCEntry) -> list[tuple[str, str]]:
-        queries = self._query_names(entry)
-        labels: list[tuple[str, str]] = []
-        if 'broad_reach_ips' in queries:
-            labels.append((LABEL_VECTRA_POPULAR_IP, COLOR_POPULAR_IP))
-        if self.strong_raw_ips or any(q != 'broad_reach_ips' for q in queries):
-            labels.append((LABEL_VECTRA_BENIGN, COLOR_VECTRA))
-        return labels
-
-    def _find_observable(self, obs_type: str, value: str) -> dict | None:
-        try:
-            results = self.helper.api.stix_cyber_observable.list(
-                types=[obs_type],
-                filters={
-                    "mode": "and",
-                    "filters": [{"key": "value", "values": [value]}],
-                    "filterGroups": [],
-                },
-                first=1,
-            )
-            return results[0] if results else None
-        except Exception as exc:
-            self.helper.log_warning(
-                f"[vectra-fp] observable lookup failed {obs_type}:{value}: {exc}"
-            )
-            return None
-
-    def _create_observable(self, obs_type: str, value: str) -> str | None:
-        stix_type = {
-            "IPv4-Addr":   "ipv4-addr",
-            "Domain-Name": "domain-name",
-        }.get(obs_type)
-        if not stix_type:
-            return None
-        try:
-            created = self.helper.api.stix_cyber_observable.create(
-                observableData={
-                    "type":  stix_type,
-                    "value": value,
-                    "x_opencti_score":       self.fp_score,
-                    "x_opencti_description": (
-                        f"Auto-created by Vectra Metadata FP Discovery "
-                        f"({obs_type}: {value}). "
-                        "Assessed as benign infrastructure based on fleet-wide "
-                        "breadth heuristic. Awaiting feed enrichment."
-                    ),
-                }
-            )
-            return created.get("id")
-        except Exception as exc:
-            self.helper.log_error(
-                f"[vectra-fp] observable create failed {obs_type}:{value}: {exc}"
-            )
-            return None
-
-    def _add_label(self, obs_id: str, label: str, color: str) -> bool:
-        # label.create is idempotent — returns existing label if value already exists.
-        try:
-            result = self.helper.api.label.create(value=label, color=color)
-            self.helper.api.stix_cyber_observable.add_label(id=obs_id, label_id=result["id"])
-            return True
-        except Exception as exc:
-            self.helper.log_warning(f"[vectra-fp] add_label failed '{label}': {exc}")
-            return False
-
-    def _add_discovery_note(
-        self, obs_id: str, entry: IOCEntry, query_label: str
-    ) -> None:
-        """Attach a markdown note with full metadata context to the observable."""
-        ctx = entry.context
-        bucket = self._breadth_bucket(entry.breadth)
-        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-        ctx_rows = [(k, v) for k, v in ctx.items()
-                    if k not in _CTX_SKIP and v is not None and v != '']
-
-        table_md = "\n".join(
-            f"| `{k}` | `{v}` |" for k, v in ctx_rows
-        ) if ctx_rows else "*(no additional context)*"
-
-        query_labels = ctx.get('_query_labels') or {entry.query_name: query_label}
-        query_md = "\n".join(
-            f"- `{name}` — {label}" for name, label in query_labels.items()
+    def _find_observable(self, observable_type: str, value: str) -> dict | None:
+        found = self.helper.api.stix_cyber_observable.list(
+            types=[observable_type], first=1,
+            filters={"mode": "and", "filters": [{"key": "value", "values": [value]}], "filterGroups": []},
+            customAttributes="""id entity_type observable_value x_opencti_score objectLabel { id value } indicators(first: 1) { edges { node { id } } }""",
         )
-        breadth_subject = (
-            "users" if set(query_labels) == {"shared_auth_ips"}
-            else "internal hosts/users"
+        return found[0] if found else None
+
+    def _create_observable(self, plan: EvidencePlan) -> dict | None:
+        stix_type = "domain-name" if plan.observable_type == "Domain-Name" else "ipv4-addr"
+        created = self.helper.api.stix_cyber_observable.create(observableData={
+            "type": stix_type, "value": plan.value,
+            "x_opencti_description": "Discovered as a recurring common endpoint by Vectra Metadata; commonness is not a benign verdict.",
+        })
+        return created or None
+
+    def _ensure_label(self, entity: dict, label: str) -> None:
+        if label in _labels(entity):
+            return
+        created = self.helper.api.label.create(value=label, color=LABEL_COLORS[label])
+        self.helper.api.stix_cyber_observable.add_label(id=entity["id"], label_id=created["id"])
+
+    @staticmethod
+    def _note_id(source_id: str, observable_type: str, value: str) -> str:
+        return "note--" + str(uuid.uuid5(NOTE_NAMESPACE, f"{source_id}|{observable_type}|{value}"))
+
+    def _upsert_evidence(self, entity: dict, plan: EvidencePlan) -> None:
+        grouped: dict[str, list[dict]] = defaultdict(list)
+        for row in sorted(plan.observations, key=lambda item: (item.signal, item.window_id)):
+            grouped[row.signal].append({
+                "window": row.window_id, "breadth": row.breadth,
+                "events": row.event_count, "first_seen": row.first_seen,
+                "last_seen": row.last_seen,
+            })
+        payload = {
+            "schema_version": 1, "query_version": QUERY_VERSION,
+            "source_id": self.source_id, "observable_type": plan.observable_type,
+            "signals": dict(grouped), "qualifying_signals": sorted(plan.qualifying_signals),
+            "discovery": plan.discovery, "lookback_days": self.lookback_days,
+            "updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        }
+        digest = hashlib.sha256(f"{plan.observable_type}:{plan.value}".encode()).hexdigest()[:12]
+        self.helper.api.note.create(
+            stix_id=self._note_id(self.source_id, plan.observable_type, plan.value),
+            abstract=f"vectra-commonness:{self.source_id}:{digest}",
+            content=json.dumps(payload, sort_keys=True, separators=(",", ":")),
+            objects=[entity["id"]], confidence=60, update=True,
         )
 
-        content = (
-            f"## Vectra Metadata — Benign IOC Discovery\n\n"
-            f"**Observable:** `{entry.value}`  \n"
-            f"**Type:** `{entry.ioc_type}`  \n"
-            f"**Discovery Queries:**\n{query_md}\n\n"
-            f"**Host/User Breadth:** **{entry.breadth}** distinct {breadth_subject}  \n"
-            f"**Breadth Tier:** `{bucket}`  \n"
-            f"**Lookback:** {self.lookback_days} days  \n\n"
-            f"### Metadata Context\n\n"
-            f"| Field | Value |\n|---|---|\n"
-            f"{table_md}\n\n"
-            f"---\n"
-            f"*Generated by `connector-vectra-metadata-fp` at {ts}*"
-        )
+    def _write_plan(self, plan: EvidencePlan, allow_create: bool) -> str:
+        entity = plan.entity or self._find_observable(plan.observable_type, plan.value)
+        created = entity is None
+        if created:
+            if not allow_create:
+                return "not_created"
+            entity = self._create_observable(plan)
+            if entity is None:
+                return "failed"
+            entity.setdefault("objectLabel", [])
+            entity.setdefault("x_opencti_score", None)
+        signals = plan.qualifying_signals
+        if plan.observable_type == "Domain-Name":
+            self._ensure_label(entity, LABEL_COMMON_DOMAIN)
+        if "isession" in signals:
+            self._ensure_label(entity, LABEL_COMMON_IP)
+        if "m365" in signals:
+            self._ensure_label(entity, LABEL_SHARED_AUTH_IP)
+        if _is_conflict(entity):
+            self._ensure_label(entity, LABEL_CONFLICT)
+        self._upsert_evidence(entity, plan)
+        return "created" if created else "updated"
 
+    @staticmethod
+    def _note_refs(note: dict) -> list[str]:
+        objects = note.get("objects") or {}
+        edges = objects.get("edges", []) if isinstance(objects, dict) else objects
+        return [str((edge.get("node") or edge).get("id")) for edge in edges
+                if isinstance(edge, dict) and (edge.get("node") or edge).get("id")]
+
+    def _reconcile_stale(self) -> int:
+        if not self.write_enabled or not self._sweep_complete or not all(self._wrapped.values()):
+            return 0
         try:
-            self.helper.api.note.create(
-                abstract=(
-                    f"Vectra FP: {entry.ioc_type}:{entry.value} "
-                    f"breadth={entry.breadth} [{', '.join(query_labels)}]"
-                ),
-                content=content,
-                objectRefs=[obs_id],
-                confidence=self.confidence,
+            label_ids = []
+            for value in OWNED_LABELS:
+                label_ids.extend(label["id"] for label in self.helper.api.label.list(search=value, first=20)
+                                 if label.get("value") == value)
+            observables = [] if not label_ids else self.helper.api.stix_cyber_observable.list(
+                filters={"mode": "and", "filters": [{"key": "objectLabel", "values": label_ids}], "filterGroups": []},
+                first=500, getAll=True,
             )
-        except Exception as exc:
-            self.helper.log_warning(f"[vectra-fp] note create failed: {exc}")
-
-    # ── IOC import pipeline ────────────────────────────────────────────────────
-
-    def _import_ioc(self, entry: IOCEntry, query_label: str) -> bool:
-        """
-        Import one IOC entry into OpenCTI.  Returns True if the observable was
-        newly created or had labels/notes applied this cycle.
-
-        Pipeline:
-          1. Dedup check (within this cycle)
-          2. Find or create observable
-          3. Safety guard — skip if existing score ≥ malicious_guard
-          4. Diff labels: apply source label, breadth tier, and the opt-in
-             fp-candidate label on observables missing them.
-          5. Attach a discovery note whenever the source/cascade label is newly
-             applied.
-        """
-        key = (entry.ioc_type, entry.value)
-        if key in self._seen_this_cycle:
-            return False
-        self._seen_this_cycle.add(key)
-
-        existing = self._find_observable(entry.ioc_type, entry.value)
-        if existing:
-            raw_score = existing.get("x_opencti_score")
-            existing_score = int(raw_score) if raw_score is not None else 50
-            if existing_score >= self.malicious_guard:
-                self.helper.log_info(
-                    f"[vectra-fp] SKIP confirmed-malicious "
-                    f"{entry.ioc_type}:{entry.value} score={existing_score}"
+            object_ids = [entity["id"] for entity in observables]
+            notes_by_id = {}
+            for index in range(0, len(object_ids), 50):
+                notes = self.helper.api.note.list(
+                    filters={"mode": "and", "filters": [{"key": "objects", "values": object_ids[index:index + 50]}], "filterGroups": []},
+                    first=500, getAll=True,
                 )
-                return False
-            obs_id = existing["id"]
-            existing_labels: set[str] = {
-                lbl.get("value", "")
-                for lbl in (existing.get("objectLabel") or [])
-            }
-            is_new = False
+                for note in notes:
+                    abstract = str(note.get("attribute_abstract") or note.get("abstract") or "")
+                    if abstract.startswith(f"vectra-commonness:{self.source_id}:"):
+                        notes_by_id[note["id"]] = note
+        except Exception as exc:
+            self.helper.log_warning(f"[vectra-commonness] stale reconciliation skipped: {exc}")
+            return 0
+        removed = 0
+        for note in notes_by_id.values():
+            for object_id in self._note_refs(note):
+                entity = self.helper.api.stix_cyber_observable.read(id=object_id)
+                if not entity:
+                    continue
+                value = (normalize_domain if entity.get("entity_type") == "Domain-Name" else normalize_ipv4)(entity.get("observable_value"))
+                key = (entity.get("entity_type"), value) if value else None
+                if key in self._sweep_active:
+                    continue
+                attached = self.helper.api.note.list(
+                    filters={"mode": "and", "filters": [{"key": "objects", "values": [object_id]}], "filterGroups": []},
+                    first=100, getAll=True,
+                )
+                commonness_refs = sum(str(item.get("attribute_abstract") or item.get("abstract") or "").startswith("vectra-commonness:")
+                                      for item in attached)
+                if commonness_refs <= 1:
+                    for label in entity.get("objectLabel") or []:
+                        if label.get("value") in OWNED_LABELS and label.get("id"):
+                            self.helper.api.stix_cyber_observable.remove_label(id=object_id, label_id=label["id"])
+                self.helper.api.stix_domain_object.delete(id=note["id"])
+                removed += 1
+        self._sweep_active.clear()
+        self._sweep_complete = True
+        self._wrapped = {"Domain-Name": False, "IPv4-Addr": False}
+        return removed
+
+    def _run_cycle(self, client: VectraMetadataClient) -> dict:
+        self._client = client
+        started = time.monotonic()
+        metrics = defaultdict(int)
+        windows = build_windows(lookback_days=self.lookback_days)
+        entities_list = []
+        for observable_type in ("Domain-Name", "IPv4-Addr"):
+            page, _ = self._observable_page(observable_type)
+            entities_list.extend(page)
+        entities = {(item["entity_type"], item["observable_value"]): item for item in entities_list}
+        lookup_rows, lookup_complete = self._targeted(entities_list, windows, metrics)
+        discovery_rows, discovery_complete = self._discover(windows, metrics)
+        discovery_keys = {(row.observable_type, row.value) for row in discovery_rows}
+        plans = self._plans([*lookup_rows, *discovery_rows], discovery_keys, entities)
+        qualified = {key: plan for key, plan in plans.items() if plan.qualifies}
+        for plan in qualified.values():
+            if plan.discovery and plan.entity is None:
+                plan.entity = self._find_observable(plan.observable_type, plan.value)
+        self._sweep_active.update(qualified)
+        self._sweep_complete &= lookup_complete and discovery_complete
+        missing_discovery = sorted(key for key, plan in qualified.items() if plan.discovery and plan.entity is None)
+        selected_create = set(missing_discovery[:self.creation_limit])
+        metrics["candidates"] = len(entities)
+        metrics["discovered"] = len(discovery_keys)
+        metrics["qualified"] = len(qualified)
+        metrics["rejected"] = len(plans) - len(qualified)
+        metrics["reused"] = sum(plan.entity is not None for plan in qualified.values())
+        metrics["missing"] = len(missing_discovery)
+        metrics["conflicts"] = sum(plan.entity is not None and _is_conflict(plan.entity) for plan in qualified.values())
+        metrics["projected_writes"] = metrics["reused"] + (2 * len(selected_create))
+        for name in ("partial", "error", "throttled", "unsupported", "created", "updated", "stale_removed"):
+            metrics[name] += 0
+        if self.write_enabled:
+            for key, plan in sorted(qualified.items()):
+                result = self._write_plan(plan, key in selected_create)
+                metrics[result] += 1
+            metrics["stale_removed"] = self._reconcile_stale()
+        if all(self._wrapped.values()) and (not self.write_enabled or not self._sweep_complete):
+            metrics["stale_skipped"] += int(self.write_enabled and not self._sweep_complete)
+            self._sweep_active.clear()
+            self._sweep_complete = True
+            self._wrapped = {"Domain-Name": False, "IPv4-Addr": False}
         else:
-            if not self.create_missing:
-                self._skipped_missing += 1
-                self.helper.log_debug(
-                    f"[vectra-fp] skip missing {entry.ioc_type}:{entry.value} "
-                    "(VECTRA_FP_CREATE_MISSING=false)"
-                )
-                return False
-            obs_id = self._create_observable(entry.ioc_type, entry.value)
-            if not obs_id:
-                return False
-            existing_labels = set()
-            is_new = True
-
-        new_bucket = self._breadth_bucket(entry.breadth)
-        needs_fp  = self.apply_fp_candidate and LABEL_FP_CANDIDATE not in existing_labels
-        source_labels = [
-            (label, color) for label, color in self._source_labels(entry)
-            if label not in existing_labels
-        ]
-        needs_breadth_lbl = f"breadth:{new_bucket}" not in existing_labels
-
-        if not needs_fp and not source_labels and not needs_breadth_lbl:
-            self.helper.log_debug(
-                f"[vectra-fp] seen {entry.ioc_type}:{entry.value} "
-                f"breadth={entry.breadth} query={entry.query_name}"
-            )
-            return False
-
-        # Apply labels independently so failures are retried next cycle.
-        # Note is attached when the first source/cascade label is newly applied;
-        # this deduplicates notes across cycles naturally.
-        noted = False
-        if needs_fp:
-            ok_fp = self._add_label(obs_id, LABEL_FP_CANDIDATE, COLOR_FP)
-            if ok_fp:
-                self._add_discovery_note(obs_id, entry, query_label)
-                noted = True
-        for label, color in source_labels:
-            ok_source = self._add_label(obs_id, label, color)
-            if ok_source and not noted:
-                self._add_discovery_note(obs_id, entry, query_label)
-                noted = True
-
-        if needs_breadth_lbl:
-            self._add_label(obs_id, f"breadth:{new_bucket}", COLOR_BREADTH)
-
-        action = "imported" if is_new else "labelled"
-        self.helper.log_debug(
-            f"[vectra-fp] {action} {entry.ioc_type}:{entry.value} "
-            f"breadth={entry.breadth} query={entry.query_name}"
-        )
-        return True
-
-    # ── query execution ────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _collect_ioc(
-        aggregate: dict[tuple[str, str], dict], entry: IOCEntry, query_label: str
-    ) -> None:
-        key = (entry.ioc_type, entry.value)
-        item = aggregate.setdefault(
-            key,
-            {"entry": entry, "query_labels": {}, "context_count": 0},
-        )
-        if entry.breadth > item["entry"].breadth:
-            item["entry"] = entry
-        item["query_labels"][entry.query_name] = query_label
-        item["context_count"] += 1
-
-    @staticmethod
-    def _aggregated_entry(item: dict) -> IOCEntry:
-        best: IOCEntry = item["entry"]
-        ctx = dict(best.context)
-        ctx["_query_labels"] = item["query_labels"]
-        ctx["_matched_queries"] = list(item["query_labels"])
-        ctx["_context_count"] = item["context_count"]
-        return IOCEntry(
-            ioc_type=best.ioc_type,
-            value=best.value,
-            breadth=best.breadth,
-            query_name=",".join(item["query_labels"]),
-            context=ctx,
-        )
-
-    def _process_query(
-        self,
-        qdef: QueryDefinition,
-        client: VectraMetadataClient,
-        aggregate: dict[tuple[str, str], dict],
-    ) -> tuple[int, int]:
-        """
-        Execute one query and collect extracted IOCs.
-
-        Returns: (rows_returned, iocs_extracted)
-        """
-        sql = qdef.build_sql(
-            days=self.lookback_days,
-            host_threshold=self.host_threshold,
-            user_threshold=self.user_threshold,
-            max_results=self.max_results,
-        )
-
-        self.helper.log_info(
-            f"[vectra-fp] running query: {qdef.name} "
-            f"(days={self.lookback_days}, "
-            f"host_threshold={self.host_threshold}, "
-            f"user_threshold={self.user_threshold})"
-        )
-
-        try:
-            rows = client.execute(sql)
-        except VectraMetadataError as exc:
-            self.helper.log_error(
-                f"[vectra-fp] query {qdef.name} failed: {exc}"
-            )
-            return 0, 0
-
-        n_rows = len(rows)
-        n_iocs = 0
-
-        for entry in qdef.extract_iocs(rows):
-            n_iocs += 1
-            self._collect_ioc(aggregate, entry, qdef.label)
-
-        self.helper.log_info(
-            f"[vectra-fp] {qdef.name}: rows={n_rows} iocs={n_iocs}"
-        )
-        return n_rows, n_iocs
-
-    # ── cycle ──────────────────────────────────────────────────────────────────
-
-    def _run_cycle(self, client: VectraMetadataClient) -> None:
-        """Execute all 6 queries and import results for one cycle."""
-        self._seen_this_cycle = set()
-        self._skipped_missing = 0
-        cycle_start = time.monotonic()
-
-        total_rows = total_iocs = total_imported = 0
-        aggregate: dict[tuple[str, str], dict] = {}
-
-        for idx, qdef in enumerate(ALL_QUERIES):
-            if idx > 0 and self.inter_query_delay_sec > 0:
-                time.sleep(self.inter_query_delay_sec)
-            r, n = self._process_query(qdef, client, aggregate)
-            total_rows += r
-            total_iocs += n
-
-        for item in aggregate.values():
-            entry = self._aggregated_entry(item)
-            query_label = "; ".join(item["query_labels"].values())
-            if self._import_ioc(entry, query_label):
-                total_imported += 1
-
-        elapsed = time.monotonic() - cycle_start
-        self.helper.log_info(
-            f"[vectra-fp] cycle complete: "
-            f"total_rows={total_rows} "
-            f"total_iocs_extracted={total_iocs} "
-            f"unique_iocs={len(aggregate)} "
-            f"total_imported={total_imported} "
-            f"skipped_missing={self._skipped_missing} "
-            f"elapsed={elapsed:.1f}s "
-            f"next_run_in={self.interval_sec}s"
-        )
-
-    # ── main loop ──────────────────────────────────────────────────────────────
+            metrics["stale_skipped"] += 0
+        metrics["elapsed_seconds"] = round(time.monotonic() - started, 3)
+        summary = dict(metrics)
+        summary["runtime_seconds"] = round(summary.get("runtime_seconds", 0), 3)
+        summary["mode"] = "write" if self.write_enabled else "shadow"
+        summary["source_id"] = self.source_id
+        self.helper.log_info("[vectra-commonness] " + json.dumps(summary, sort_keys=True))
+        return summary
 
     def run(self) -> None:
-        """Start the connector.  Runs immediately then sleeps for interval_sec."""
-        self.helper.log_info(
-            f"[vectra-fp] starting — "
-            f"lookback_days={self.lookback_days} "
-            f"host_threshold={self.host_threshold} "
-            f"user_threshold={self.user_threshold} "
-            f"interval_sec={self.interval_sec}"
-        )
-
+        self.helper.log_info(f"[vectra-commonness] starting mode={'write' if self.write_enabled else 'shadow'}")
         while True:
-            # Client is cached on self._client; only rebuilt when absent.
-            # Env-var changes (credentials, URLs) take effect on next container restart.
             if self._client is None:
                 try:
                     self._client = self._build_client()
-                except Exception as exc:   # V16: defensive — _build_client rarely raises
-                    self.helper.log_error(
-                        f"[vectra-fp] client init error: {exc}\n{traceback.format_exc()}"
-                    )
+                except Exception as exc:
+                    self.helper.log_error(f"[vectra-commonness] client init failed: {exc}\n{traceback.format_exc()}")
             if self._client is not None:
                 try:
                     self._run_cycle(self._client)
                 except KeyboardInterrupt:
                     raise
                 except Exception as exc:
-                    self.helper.log_error(
-                        f"[vectra-fp] cycle error: {exc}\n{traceback.format_exc()}"
-                    )
+                    self.helper.log_error(f"[vectra-commonness] cycle failed: {exc}\n{traceback.format_exc()}")
             time.sleep(self.interval_sec)
 
 
-# ── entry point ───────────────────────────────────────────────────────────────
+# Backward-compatible import name while deployment path remains unchanged.
+VectraMetadataFPConnector = VectraMetadataCommonnessConnector
 
 if __name__ == "__main__":
-    connector = VectraMetadataFPConnector()
-    connector.run()
+    VectraMetadataCommonnessConnector().run()
