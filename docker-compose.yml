@@ -317,7 +317,7 @@ services:
     build:
       context: ./connectors/cidr-enrichment-filter
       args:
-        BASE_IMAGE: opencti/connector-abuseipdb:latest
+        BASE_IMAGE: opencti/connector-abuseipdb:7.260910.0
         CIDR_FILTER_CONNECTOR: abuseipdb
     image: local/connector-abuseipdb-cidr-filter:latest
     environment:
@@ -340,7 +340,7 @@ services:
     build:
       context: ./connectors/cidr-enrichment-filter
       args:
-        BASE_IMAGE: opencti/connector-ipqs:latest
+        BASE_IMAGE: opencti/connector-ipqs:7.260910.0
         CIDR_FILTER_CONNECTOR: ipqs
     image: local/connector-ipqs-cidr-filter:latest
     environment:
@@ -353,6 +353,12 @@ services:
       # Paid enrichment is user-requested through OpenCTI UI/GraphQL only.
       - CONNECTOR_AUTO=false
       - CONNECTOR_CONFIDENCE_LEVEL=80
+      - CONNECTOR_EXPOSE_METRICS=true
+      - CONNECTOR_METRICS_NAMESPACE=opencti
+      - CONNECTOR_METRICS_SUBSYSTEM=ipqs
+      - IPQS_QUOTA_COOLDOWN_SECONDS=${IPQS_QUOTA_COOLDOWN_SECONDS:-3600}
+      - IPQS_RECENT_ENRICHMENT_SECONDS=${IPQS_RECENT_ENRICHMENT_SECONDS:-300}
+      - ENRICHMENT_QUOTA_MAX_COOLDOWN_SECONDS=${ENRICHMENT_QUOTA_MAX_COOLDOWN_SECONDS:-86400}
       - IPQS_PRIVATE_KEY=${IPQS_API_KEY}
       - IPQS_MAX_TLP=TLP:AMBER
       - IPQS_IP_ADD_RELATIONSHIPS=false
@@ -383,7 +389,7 @@ services:
     build:
       context: ./connectors/cidr-enrichment-filter
       args:
-        BASE_IMAGE: opencti/connector-virustotal:latest
+        BASE_IMAGE: opencti/connector-virustotal:7.260910.0
         CIDR_FILTER_CONNECTOR: virustotal
     image: local/connector-virustotal-cidr-filter:latest
     environment:
@@ -391,11 +397,18 @@ services:
       - OPENCTI_TOKEN=${OPENCTI_ADMIN_TOKEN}
       - CONNECTOR_ID=${CONNECTOR_VIRUSTOTAL_ID}
       - CONNECTOR_NAME=VirusTotal
-      # URLs stay with IPQS: VirusTotal URL enrichment performs extra API lookups.
-      - CONNECTOR_SCOPE=StixFile,Artifact,IPv4-Addr,Domain-Name
+      # URL lookups provide fallback reputation when IPQS is quota-blocked.
+      # Uploads remain disabled, so unseen URLs are never submitted to VT.
+      - CONNECTOR_SCOPE=StixFile,Artifact,IPv4-Addr,Domain-Name,Url
       # Paid enrichment is user-requested through OpenCTI UI/GraphQL only.
       - CONNECTOR_AUTO=false
       - CONNECTOR_CONFIDENCE_LEVEL=75
+      - CONNECTOR_EXPOSE_METRICS=true
+      - CONNECTOR_METRICS_NAMESPACE=opencti
+      - CONNECTOR_METRICS_SUBSYSTEM=virustotal
+      - VIRUSTOTAL_QUOTA_COOLDOWN_SECONDS=${VIRUSTOTAL_QUOTA_COOLDOWN_SECONDS:-3600}
+      - VIRUSTOTAL_RECENT_ENRICHMENT_SECONDS=${VIRUSTOTAL_RECENT_ENRICHMENT_SECONDS:-300}
+      - ENRICHMENT_QUOTA_MAX_COOLDOWN_SECONDS=${ENRICHMENT_QUOTA_MAX_COOLDOWN_SECONDS:-86400}
       - VIRUSTOTAL_TOKEN=${VT_API_KEY}
       - VIRUSTOTAL_MAX_TLP=TLP:AMBER
       - VIRUSTOTAL_REPLACE_WITH_LOWER_SCORE=true

@@ -6,7 +6,7 @@ You can find the detailed documentation about the Docker installation in the [Op
 
 ## VirusTotal and IPQS enrichment
 
-VirusTotal and IPQS are paid, on-demand enrichment connectors. They stay running with `CONNECTOR_AUTO=false`; importing an observable does not call either provider. An authorized user must select a connector in the OpenCTI UI or request it through GraphQL. IPQS handles IPv4 addresses, domains, and URLs. VirusTotal handles files, artifacts, IPv4 addresses, and domains.
+VirusTotal and IPQS are paid, on-demand enrichment connectors. They stay running with `CONNECTOR_AUTO=false`; importing an observable does not call either provider. An authorized user must select a connector in the OpenCTI UI or request it through GraphQL. IPQS handles IPv4 addresses, domains, and URLs. VirusTotal handles files, artifacts, IPv4 addresses, domains, and URLs; unseen URL submission remains disabled.
 
 ### One-time rollout
 
@@ -18,7 +18,7 @@ set -a; source .env; set +a
 docker compose stop connector-ipqs connector-virustotal
 docker compose exec rabbitmq rabbitmqctl purge_queue "listen_${CONNECTOR_IPQS_ID}"
 docker compose exec rabbitmq rabbitmqctl purge_queue "listen_${CONNECTOR_VIRUSTOTAL_ID}"
-docker compose up -d --force-recreate connector-ipqs connector-virustotal
+docker compose up -d --build --force-recreate connector-ipqs connector-virustotal
 
 docker compose exec rabbitmq rabbitmqctl list_queues \
   name messages_ready messages_unacknowledged | \
@@ -45,6 +45,25 @@ JSON
 ```
 
 A successful response contains the created work ID under `data.stixCoreObjectEdit.askEnrichment.id`.
+
+### Quota circuit and usage metrics
+
+IPQS insufficient-credit/HTTP 429 responses and VirusTotal HTTP 429 responses open an in-process provider circuit. While open, requested work completes with an actionable cooldown error and makes no provider call. The default cooldown is one hour, bounded to 24 hours; provider `Retry-After` headers take precedence within that bound.
+
+Configure cooldowns with `IPQS_QUOTA_COOLDOWN_SECONDS`, `VIRUSTOTAL_QUOTA_COOLDOWN_SECONDS`, and `ENRICHMENT_QUOTA_MAX_COOLDOWN_SECONDS`. Normal enrichment resumes automatically when the cooldown expires. After confirming quota recovery, an operator can reset immediately by restarting only that connector:
+
+```bash
+docker compose restart connector-ipqs       # or connector-virustotal
+```
+
+Each connector exposes Prometheus metrics on its internal port `9095`. `opencti_enrichment_requests_total` is labelled by `provider`, `observable_type`, and `outcome` (`requested`, `executed`, `skipped`, `successful`, `failed`, or `quota_blocked`) and never contains observable values or credentials. `opencti_url_reputation_provider_ready` is `1` only when that provider has `Url` scope and its quota circuit is closed: two ready providers is healthy, one is degraded, and zero means URL reputation is unavailable. Inspect metrics without publishing a host port:
+
+```bash
+docker compose exec connector-ipqs python -c \
+  'import urllib.request; print(urllib.request.urlopen("http://localhost:9095/metrics").read().decode())'
+```
+
+OpenCTI accepts duplicate explicit UI/GraphQL requests as separate work items, so each provider also skips the same OpenCTI object for five minutes after an executed request. Configure that window with `IPQS_RECENT_ENRICHMENT_SECONDS` or `VIRUSTOTAL_RECENT_ENRICHMENT_SECONDS`; restarting the connector clears it.
 
 ## XTM One
 

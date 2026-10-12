@@ -983,7 +983,9 @@ class IocTrustClusterConnector:
                 observableData={
                     "type":  stix_type,
                     "value": value,
-                    "x_opencti_score": 50,
+                    # Zero is OpenCTI's non-suspicious score. UNKNOWN is a lack
+                    # of evidence, not the platform's neutral/suspicious score 50.
+                    "x_opencti_score": 0,
                     "x_opencti_description": (
                         f"Auto-created trust-cluster anchor ({obs_type}: {value}). "
                         "UNKNOWN until a feed connector assigns a real score."

@@ -28,7 +28,17 @@ The connector alone owns the inherited outputs `trust-cluster:fp-candidate` and 
 
 Propagation requires a connector-owned child→parent `related-to` relationship. Only real `IPv4-Addr`, `IPv6-Addr`, and `Domain-Name` parents participate; label-only ASN/JA4 groups do not. A benign parent must carry `fp-confirmed` and remain below the malicious threshold. Its child must be at or below `TRUST_CLUSTER_FP_CASCADE_SCORE_MAX` (default `50`), below the malicious threshold, and have no malicious cascade label or linked high-score Indicator. A directly malicious or sinkhole parent applies inherited malicious state to each direct child. Unknown and inherited-only parents do not fan out, and propagation is one hop.
 
-Zero assignments are therefore valid when no parent has a direct assessment, no eligible child relationship exists, or the connector has not received a parent/child update event.
+Zero assignments are therefore valid when no parent has a direct assessment, no eligible child relationship exists, or the connector has not received a parent/child update event. Synthetic UNKNOWN parent anchors are created with score `0`; OpenCTI's score `50` is not used because downstream clients commonly treat it as suspicious.
+
+Legacy synthetic anchors can be migrated safely after reviewing a dry run:
+
+```sh
+python3 connectors/ioc-trust-cluster/scripts/migrate_unknown_anchor_scores.py dry-run
+python3 connectors/ioc-trust-cluster/scripts/migrate_unknown_anchor_scores.py apply
+python3 connectors/ioc-trust-cluster/scripts/migrate_unknown_anchor_scores.py verify
+```
+
+The migration requires `OPENCTI_URL` and `OPENCTI_TOKEN`. It changes only score-50 observables with the exact generated anchor description and no labels, indicators, external references, or creator; every candidate is re-read immediately before update.
 
 ## Optional OpenCTI contract smoke test
 

@@ -933,6 +933,17 @@ class TestCidrLinking:
         obs_data = created_args.kwargs.get("observableData") or created_args.args[0]
         assert obs_data["value"] == "10.20.30.0/24"
         assert obs_data["type"] == "ipv4-addr"
+        assert obs_data["x_opencti_score"] == 0
+
+    def test_new_unknown_parent_is_not_suspicious_or_malicious(self):
+        child = _obs(value="10.20.30.40")
+        _wire(self.c, child)
+
+        self.c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
+
+        obs_data = self.c.helper.api.stix_cyber_observable.create.call_args.kwargs["observableData"]
+        assert obs_data["x_opencti_score"] == 0
+        assert self.c._classify_parent(obs_data["x_opencti_score"], set()) == "UNKNOWN"
 
     def test_existing_cidr_parent_reused_not_duplicated(self):
         child  = _obs(value="10.20.30.40")
