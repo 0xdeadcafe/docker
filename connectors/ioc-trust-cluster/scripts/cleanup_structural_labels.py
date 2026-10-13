@@ -116,6 +116,11 @@ def load_relationships(es_url: str, rel_index: str) -> list[dict[str, Any]]:
             ["internal_id", "relationship_type", "description", "connections"],
         )
         for src in rows:
+            if (
+                src.get("relationship_type") != rel_type
+                or src.get("description") != TRUST_REL_DESCRIPTION
+            ):
+                continue
             frm, to = endpoint(src, "from"), endpoint(src, "to")
             label_value = structural_label_value(to["value"])
             if frm["id"] and to["id"] and label_value:
@@ -281,7 +286,7 @@ def report(state: dict[str, Any], sample: int, heading: str = "inventory") -> No
             print(f"  {row['label_id']} {row['label_value']}")
 
 
-def graphql(endpoint: str, token: str, query: str, variables: dict[str, Any]) -> None:
+def graphql(endpoint: str, token: str, query: str, variables: dict[str, Any]) -> dict[str, Any]:
     req = urllib.request.Request(
         endpoint,
         data=json.dumps({"query": query, "variables": variables}).encode(),
@@ -291,6 +296,7 @@ def graphql(endpoint: str, token: str, query: str, variables: dict[str, Any]) ->
         data = json.loads(resp.read().decode())
     if data.get("errors"):
         raise RuntimeError(data["errors"])
+    return data.get("data") or {}
 
 
 def remove_one(endpoint: str, token: str, row: dict[str, str]) -> None:
@@ -309,6 +315,18 @@ def remove_one(endpoint: str, token: str, row: dict[str, str]) -> None:
     )
 
 
+def label_has_references(endpoint: str, token: str, label_id: str) -> bool:
+    query = """
+    query LabelReferences($toId: StixRef!) {
+      stixRefRelationships(
+        toId: $toId, relationship_type: ["object-label"], first: 1
+      ) { edges { node { id } } }
+    }
+    """
+    data = graphql(endpoint, token, query, {"toId": label_id})
+    return bool(data["stixRefRelationships"]["edges"])
+
+
 def delete_one(endpoint: str, token: str, row: dict[str, str]) -> None:
     query = """
     mutation LabelEdit($id: ID!) {
@@ -318,26 +336,40 @@ def delete_one(endpoint: str, token: str, row: dict[str, str]) -> None:
     graphql(endpoint, token, query, {"id": row["label_id"]})
 
 
+def delete_if_unreferenced(endpoint: str, token: str, row: dict[str, str]) -> bool:
+    if label_has_references(endpoint, token, row["label_id"]):
+        return False
+    delete_one(endpoint, token, row)
+    return True
+
+
 def execute(
     rows: list[dict[str, str]],
-    operation: Callable[[dict[str, str]], None],
+    operation: Callable[[dict[str, str]], bool | None],
     workers: int,
     progress_name: str,
-) -> tuple[list[dict[str, str]], list[tuple[dict[str, str], str]]]:
+) -> tuple[
+    list[dict[str, str]],
+    list[dict[str, str]],
+    list[tuple[dict[str, str], str]],
+]:
     completed: list[dict[str, str]] = []
+    skipped: list[dict[str, str]] = []
     errors: list[tuple[dict[str, str], str]] = []
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(operation, row): row for row in rows}
         for future in as_completed(futures):
             row = futures[future]
             try:
-                future.result()
-                completed.append(row)
-                if len(completed) % 500 == 0:
-                    print(f"{progress_name}: {len(completed)}", flush=True)
+                if future.result() is False:
+                    skipped.append(row)
+                else:
+                    completed.append(row)
+                    if len(completed) % 500 == 0:
+                        print(f"{progress_name}: {len(completed)}", flush=True)
             except Exception as exc:  # continue so one stale object does not hide the inventory
                 errors.append((row, str(exc)))
-    return completed, errors
+    return completed, skipped, errors
 
 
 def apply(state: dict[str, Any], limit: int | None, workers: int) -> int:
@@ -348,7 +380,7 @@ def apply(state: dict[str, Any], limit: int | None, workers: int) -> int:
     budget = limit if limit is not None else float("inf")
 
     association_rows = state["removals"][: int(budget)] if limit is not None else state["removals"]
-    removed, remove_errors = execute(
+    removed, _, remove_errors = execute(
         association_rows,
         lambda row: remove_one(endpoint_url, token, row),
         workers,
@@ -360,9 +392,9 @@ def apply(state: dict[str, Any], limit: int | None, workers: int) -> int:
     post_removal_plan = label_cleanup_plan(state["labels"], state["references"], removed_pairs)
     orphan_rows = post_removal_plan["orphaned"]
     delete_rows = orphan_rows[: max(0, int(budget))] if limit is not None else orphan_rows
-    deleted, delete_errors = execute(
+    deleted, protected_at_delete, delete_errors = execute(
         delete_rows,
-        lambda row: delete_one(endpoint_url, token, row),
+        lambda row: delete_if_unreferenced(endpoint_url, token, row),
         workers,
         "deleted_orphan_definitions",
     )
@@ -371,6 +403,7 @@ def apply(state: dict[str, Any], limit: int | None, workers: int) -> int:
     errors = remove_errors + delete_errors
     print(f"removed_structural_associations: {len(removed)}")
     print(f"deleted_orphan_definitions: {len(deleted)}")
+    print(f"protected_at_delete: {len(protected_at_delete)}")
     print(f"skipped_label_definitions: {skipped}")
     print(f"errors: {len(errors)}")
     for row, error in errors[:10]:

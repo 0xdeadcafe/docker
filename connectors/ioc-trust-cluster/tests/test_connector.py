@@ -695,6 +695,7 @@ class TestGetAnnouncedCidr:
         with patch.object(_mod, "IPWhois", return_value=mock_instance):
             result = self.c._get_announced_cidr("8.8.8.8")
         assert result is None
+        assert "8.8.8.8" not in self.c._cidr_cache
 
     def test_ip_defined_error_returns_none(self):
         mock_instance = MagicMock()
@@ -703,12 +704,17 @@ class TestGetAnnouncedCidr:
             result = self.c._get_announced_cidr("8.8.8.8")
         assert result is None
 
-    def test_general_exception_returns_none(self):
+    def test_general_exception_is_retried_and_recovers(self):
         mock_instance = MagicMock()
-        mock_instance.lookup_rdap.side_effect = RuntimeError("timeout")
+        mock_instance.lookup_rdap.side_effect = [
+            RuntimeError("timeout"), self._rdap_result(),
+        ]
         with patch.object(_mod, "IPWhois", return_value=mock_instance):
-            result = self.c._get_announced_cidr("8.8.8.8")
-        assert result is None
+            first = self.c._get_announced_cidr("8.8.8.8")
+            second = self.c._get_announced_cidr("8.8.8.8")
+        assert first is None
+        assert second == "8.8.8.0/24"
+        assert mock_instance.lookup_rdap.call_count == 2
 
     def test_result_is_cached_no_second_call(self):
         mock_instance = MagicMock()
@@ -781,6 +787,7 @@ class TestGetAsnOwner:
         with patch("urllib.request.urlopen", side_effect=OSError("network error")):
             name = self.c._get_asn_owner("99999")
         assert name is None
+        assert "AS99999" not in self.c._asn_desc_cache
 
     def test_invalid_asn_digits_returns_none(self):
         name = self.c._get_asn_owner("NOT_AN_ASN")
@@ -822,17 +829,26 @@ class TestGetAsnOwner:
         assert name == "GOOGLE LLC"
         assert call_count == 2   # retried once after 429
 
-    def test_http_429_max_retries_logs_warning_and_caches_none(self):
-        """B15: after max retries exhausted, logs WARNING and caches None."""
+    def test_http_429_max_retries_remains_retryable(self):
+        """B15: an exhausted rate limit does not poison the session cache."""
         import urllib.error as _ue
         http_429 = _ue.HTTPError(url="", code=429, msg="Too Many Requests", hdrs=None, fp=None)
+        response = MagicMock()
+        response.read.return_value = json.dumps({"name": "GOOGLE LLC", "entities": []}).encode()
+        response.__enter__ = lambda s: s
+        response.__exit__ = MagicMock(return_value=False)
 
-        with patch("urllib.request.urlopen", side_effect=http_429), \
-             patch("time.sleep"):
-            name = self.c._get_asn_owner("15169")
+        with patch(
+            "urllib.request.urlopen",
+            side_effect=[http_429, http_429, http_429, response],
+        ) as mock_open, patch("time.sleep"):
+            first = self.c._get_asn_owner("15169")
+            assert "AS15169" not in self.c._asn_desc_cache
+            second = self.c._get_asn_owner("15169")
 
-        assert name is None
-        assert self.c._asn_desc_cache.get("AS15169") is None
+        assert first is None
+        assert second == "GOOGLE LLC"
+        assert mock_open.call_count == 4
         assert self.c.helper.log_warning.called
 
     def test_non_http_error_does_not_retry(self):
@@ -1811,6 +1827,7 @@ class TestGetAuthoritativeNs:
     def test_dns_failure_returns_none(self):
         with patch.object(_dns_resolver, 'resolve', side_effect=Exception('NXDOMAIN')):
             assert self.c._get_authoritative_ns('nonexistent.invalid') is None
+        assert 'nonexistent.invalid' not in self.c._ns_cache
 
     def test_result_cached_no_second_query(self):
         with patch.object(_dns_resolver, 'resolve',
@@ -1820,14 +1837,17 @@ class TestGetAuthoritativeNs:
         assert first == second == 'ns1.provider.com'
         assert mock_resolve.call_count == 1
 
-    def test_none_cached_on_failure(self):
-        """Failed lookup is cached so the DNS query is not retried per observable."""
-        with patch.object(_dns_resolver, 'resolve',
-                          side_effect=Exception('timeout')) as mock_resolve:
-            self.c._get_authoritative_ns('evil.com')
-            self.c._get_authoritative_ns('evil.com')
-        assert mock_resolve.call_count == 1
-        assert self.c._ns_cache['evil.com'] is None
+    def test_failure_is_retried_and_recovers(self):
+        answers = self._ns_answers(['ns1.provider.com'])
+        with patch.object(
+            _dns_resolver, 'resolve', side_effect=[Exception('timeout'), answers]
+        ) as mock_resolve:
+            first = self.c._get_authoritative_ns('evil.com')
+            second = self.c._get_authoritative_ns('evil.com')
+        assert first is None
+        assert second == 'ns1.provider.com'
+        assert mock_resolve.call_count == 2
+        assert self.c._ns_cache['evil.com'] == 'ns1.provider.com'
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2279,6 +2299,62 @@ class TestRelationshipSourceOfTruth:
         assert "malicious-cascade from IPv4-Addr:1.2.3.0/24" in result
         c.helper.api.stix_core_relationship.create.assert_not_called()
 
+    def test_relationship_lookup_failure_preserves_inherited_state(self):
+        c = _make_connector()
+        child = _obs(labels=[LABEL_INHERITED_MALICIOUS_CASCADE])
+        c.helper.api.stix_cyber_observable.read.return_value = child
+        c.helper.api.stix_core_relationship.list.side_effect = RuntimeError("unavailable")
+
+        result = c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
+
+        assert result == "skipped: relationship resolution failed"
+        c.helper.api.stix_cyber_observable.add_label.assert_not_called()
+        c.helper.api.stix_cyber_observable.remove_label.assert_not_called()
+        c.helper.api.note.create.assert_not_called()
+
+    def test_relationship_parent_read_failure_preserves_inherited_state(self):
+        c = _make_connector()
+        child = _obs(labels=[LABEL_INHERITED_MALICIOUS_CASCADE])
+        partial_parent = {
+            "id": "cidr-001", "entity_type": "IPv4-Addr",
+            "observable_value": "1.2.3.0/24",
+        }
+        c.helper.api.stix_cyber_observable.read.side_effect = [
+            child, RuntimeError("unavailable"),
+        ]
+        c.helper.api.stix_core_relationship.list.return_value = [_trust_rel(partial_parent)]
+
+        result = c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
+
+        assert result == "skipped: relationship resolution failed"
+        c.helper.api.stix_cyber_observable.remove_label.assert_not_called()
+        c.helper.api.note.create.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "create_effect",
+        [RuntimeError("unavailable"), lambda **_: None],
+        ids=["exception", "empty-response"],
+    )
+    def test_failed_relationship_creation_does_not_mutate_inherited_state(self, create_effect):
+        c = _make_connector()
+        child = _obs(
+            entity_type="Domain-Name", value="host.evil.com", score=30,
+            labels=[LABEL_INHERITED_FP_CANDIDATE],
+        )
+        parent = _obs(
+            entity_id="parent", entity_type="Domain-Name",
+            value="evil.com", score=85,
+        )
+        _wire(c, child, parent)
+        c.helper.api.stix_core_relationship.create.side_effect = create_effect
+
+        result = c.process_message({"entity_id": "obs-001", "entity_type": "Domain-Name"})
+
+        assert result == "no actions"
+        c.helper.api.stix_cyber_observable.add_label.assert_not_called()
+        c.helper.api.stix_cyber_observable.remove_label.assert_not_called()
+        c.helper.api.note.create.assert_not_called()
+
     def test_existing_relationship_reads_parent_when_edge_payload_is_partial(self):
         c = _make_connector()
         child = _obs(value="1.2.3.4", score=50, labels=[])
@@ -2487,6 +2563,16 @@ class TestParentFanout:
             return []
         return _list
 
+    @staticmethod
+    def _rels_with_parents(trigger_id: str, child: dict, *parents: dict):
+        def _list(*args, **kwargs):
+            if kwargs.get("toId") == trigger_id:
+                return [_child_rel(child)]
+            if kwargs.get("fromId") == child["id"]:
+                return [_trust_rel(parent) for parent in parents]
+            return []
+        return _list
+
     def test_parent_malicious_fanout_labels_direct_child(self):
         c = _make_connector()
         parent = _obs(entity_id="cidr-001", value="1.2.3.0/24", score=85)
@@ -2520,6 +2606,109 @@ class TestParentFanout:
 
         assert LABEL_INHERITED_FP_CANDIDATE in _labels_created(c.helper)
         assert "fp-candidate inherited" in result
+
+    def test_parent_fanout_uses_direct_state_added_during_same_event(self):
+        sinkhole_ip = "198.51.100.1"
+        c = _make_connector({"TRUST_CLUSTER_SINKHOLE_IPS": sinkhole_ip})
+        parent = _obs(
+            entity_id="parent", entity_type="Domain-Name",
+            value="example.com", score=50,
+        )
+        child = _obs(
+            entity_id="child-1", entity_type="Domain-Name",
+            value="host.example.com", score=50,
+        )
+        c._get_resolved_ips = MagicMock(return_value=[sinkhole_ip])
+        c.helper.api.stix_cyber_observable.read.return_value = parent
+        c.helper.api.stix_core_relationship.list.side_effect = self._rels_with_parents(
+            "parent", child, parent
+        )
+
+        c.process_message({"entity_id": "parent", "entity_type": "Domain-Name"})
+
+        labels = _labels_created(c.helper)
+        assert LABEL_SINKHOLED in labels
+        assert LABEL_INHERITED_MALICIOUS_CASCADE in labels
+
+    @pytest.mark.parametrize("trigger_id", ["benign", "unknown"])
+    def test_parent_fanout_unknown_blocks_benign_across_event_order(self, trigger_id):
+        c = _make_connector()
+        parents = {
+            "benign": _obs(
+                entity_id="benign", entity_type="Domain-Name", value="good.com",
+                score=20, labels=[LABEL_FP_CONFIRMED],
+            ),
+            "unknown": _obs(
+                entity_id="unknown", entity_type="Domain-Name",
+                value="maybe.com", score=50,
+            ),
+        }
+        child = _obs(
+            entity_id="child-1", entity_type="Domain-Name",
+            value="host.example.com", score=30,
+        )
+        c.helper.api.stix_cyber_observable.read.return_value = parents[trigger_id]
+        c.helper.api.stix_core_relationship.list.side_effect = self._rels_with_parents(
+            trigger_id, child, *parents.values()
+        )
+
+        result = c.process_message({
+            "entity_id": trigger_id, "entity_type": "Domain-Name",
+        })
+
+        assert LABEL_INHERITED_FP_CANDIDATE not in _labels_created(c.helper)
+        assert "inherited" not in result
+
+    @pytest.mark.parametrize("trigger_id", ["benign", "malicious"])
+    def test_parent_fanout_malicious_wins_across_event_order(self, trigger_id):
+        c = _make_connector()
+        parents = {
+            "benign": _obs(
+                entity_id="benign", entity_type="Domain-Name", value="good.com",
+                score=20, labels=[LABEL_FP_CONFIRMED],
+            ),
+            "malicious": _obs(
+                entity_id="malicious", entity_type="Domain-Name",
+                value="evil.com", score=85,
+            ),
+        }
+        child = _obs(
+            entity_id="child-1", entity_type="Domain-Name",
+            value="host.example.com", score=30,
+        )
+        c.helper.api.stix_cyber_observable.read.return_value = parents[trigger_id]
+        c.helper.api.stix_core_relationship.list.side_effect = self._rels_with_parents(
+            trigger_id, child, *parents.values()
+        )
+
+        c.process_message({"entity_id": trigger_id, "entity_type": "Domain-Name"})
+
+        labels = _labels_created(c.helper)
+        assert LABEL_INHERITED_MALICIOUS_CASCADE in labels
+        assert LABEL_INHERITED_FP_CANDIDATE not in labels
+
+    def test_parent_unknown_fanout_retracts_owned_malicious_state(self):
+        c = _make_connector()
+        parent = _obs(
+            entity_id="parent", entity_type="Domain-Name",
+            value="example.com", score=50,
+        )
+        child = _obs(
+            entity_id="child-1", entity_type="Domain-Name",
+            value="host.example.com", score=50,
+            labels=[LABEL_INHERITED_MALICIOUS_CASCADE],
+        )
+        c.helper.api.stix_cyber_observable.read.return_value = parent
+        c.helper.api.stix_core_relationship.list.side_effect = self._rels_with_parents(
+            "parent", child, parent
+        )
+
+        result = c.process_message({"entity_id": "parent", "entity_type": "Domain-Name"})
+
+        c.helper.api.stix_cyber_observable.remove_label.assert_called_once_with(
+            id="child-1", label_id="label-0"
+        )
+        assert "inherited-state-retracted=1" in result
 
     def test_parent_unknown_fanout_creates_revocation_note_for_cascaded_child(self):
         c = _make_connector()
@@ -2594,6 +2783,68 @@ class TestParentFanout:
         assert LABEL_MALICIOUS_CASCADE not in _labels_created(c.helper)
         assert "no actions" in result
 
+    def test_high_fanout_has_bounded_output_and_child_attributed_notes(self, monkeypatch):
+        import connector as _mod
+
+        child_count = 50
+        monkeypatch.setattr(_mod, "_CACHE_MAXSIZE", 10)
+        c = _make_connector({"TRUST_CLUSTER_STATS_INTERVAL": "1"})
+        parent = _obs(
+            entity_id="parent", entity_type="Domain-Name",
+            value="evil.com", score=85,
+        )
+        children = [
+            _obs(
+                entity_id=f"child-{i}", entity_type="Domain-Name",
+                value=f"host-{i}.example.com", score=30,
+                labels=[LABEL_FP_CANDIDATE],
+            )
+            for i in range(child_count)
+        ]
+        c.helper.api.stix_cyber_observable.read.return_value = parent
+        c._trust_relationship_children = MagicMock(return_value=children)
+        c._trust_relationship_parents = MagicMock(
+            side_effect=lambda entity_id: [] if entity_id == "parent" else [parent]
+        )
+
+        result = c.process_message({"entity_id": "parent", "entity_type": "Domain-Name"})
+
+        assert len(result) < 250
+        assert f"{child_count} action(s)" in result
+        assert f"children-changed={child_count}" in result
+        assert f"malicious-cascade={child_count}" in result
+        assert f"conflicts={child_count}" in result
+        assert len(c._conflict_noted) <= 10
+        assert len(c.helper.api.note.create.call_args_list) == child_count
+        assert all(
+            call.kwargs["objectRefs"] != ["parent"]
+            for call in c.helper.api.note.create.call_args_list
+        )
+        stats = next(
+            str(call) for call in c.helper.log_info.call_args_list
+            if "stats[last" in str(call)
+        )
+        assert f"cascade_malicious={child_count}" in stats
+        assert f"cascade_conflict={child_count}" in stats
+
+    def test_advisory_note_dedup_state_is_bounded(self, monkeypatch):
+        import connector as _mod
+
+        monkeypatch.setattr(_mod, "_CACHE_MAXSIZE", 3)
+        c = _make_connector()
+        for i in range(5):
+            c._apply_parent_verdict_to_child(
+                _obs(entity_id=f"conflict-{i}", labels=[LABEL_FP_CANDIDATE]),
+                "Domain-Name", "evil.com", 85, "CONFIRMED_MALICIOUS",
+            )
+            c._apply_parent_verdict_to_child(
+                _obs(entity_id=f"revocation-{i}", labels=[LABEL_MALICIOUS_CASCADE]),
+                "Domain-Name", "example.com", 50, "UNKNOWN",
+            )
+
+        assert len(c._conflict_noted) <= 3
+        assert len(c._revocation_noted) <= 3
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # _get_resolved_ips — DNS A record lookup
@@ -2624,6 +2875,7 @@ class TestGetResolvedIps:
     def test_dns_failure_returns_empty(self):
         with patch.object(_dns_resolver, 'resolve', side_effect=Exception('NXDOMAIN')):
             assert self.c._get_resolved_ips('nonexistent.invalid') == []
+        assert 'nonexistent.invalid' not in self.c._ip_cache
 
     def test_result_cached_no_second_query(self):
         with patch.object(_dns_resolver, 'resolve',
@@ -2633,13 +2885,17 @@ class TestGetResolvedIps:
         assert first == second == ['1.2.3.4']
         assert mock_resolve.call_count == 1
 
-    def test_empty_result_cached(self):
-        with patch.object(_dns_resolver, 'resolve',
-                          side_effect=Exception('timeout')) as mock_resolve:
-            self.c._get_resolved_ips('evil.com')
-            self.c._get_resolved_ips('evil.com')
-        assert mock_resolve.call_count == 1
-        assert self.c._ip_cache['evil.com'] == []
+    def test_failure_is_retried_and_recovers(self):
+        answers = self._a_answers(['1.2.3.4'])
+        with patch.object(
+            _dns_resolver, 'resolve', side_effect=[Exception('timeout'), answers]
+        ) as mock_resolve:
+            first = self.c._get_resolved_ips('evil.com')
+            second = self.c._get_resolved_ips('evil.com')
+        assert first == []
+        assert second == ['1.2.3.4']
+        assert mock_resolve.call_count == 2
+        assert self.c._ip_cache['evil.com'] == ['1.2.3.4']
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3160,8 +3416,9 @@ class TestCacheBound:
         assert len(c._ns_cache) == 2
         assert "a.com" in c._ns_cache
 
-    def test_cache_set_stores_none_values(self):
-        """Negative cache entries (None) must also be bounded."""
+    def test_cache_set_supports_none_values(self):
+        """The bounded helper also supports advisory-dedup dictionary values."""
         c = _make_connector()
-        c._cache_set(c._cidr_cache, "1.2.3.4", None)
-        assert c._cidr_cache["1.2.3.4"] is None
+        cache = {}
+        c._cache_set(cache, "entity-1", None)
+        assert cache["entity-1"] is None

@@ -76,3 +76,76 @@ def test_structural_association_without_equivalent_graph_edge_is_not_removed():
 
     assert _mod.removable_associations(rels, labels, refs) == []
     assert _mod.label_cleanup_plan(labels, refs)["orphaned"] == []
+
+
+def test_relationship_ownership_requires_exact_type_and_description(monkeypatch):
+    def row(description, relationship_type="related-to"):
+        return {
+            "relationship_type": relationship_type,
+            "description": description,
+            "connections": [
+                {
+                    "role": f"{relationship_type}_from",
+                    "internal_id": "child-1",
+                    "name": "host.parent.example",
+                    "types": ["Domain-Name"],
+                },
+                {
+                    "role": f"{relationship_type}_to",
+                    "internal_id": "parent-1",
+                    "name": "parent.example",
+                    "types": ["Domain-Name"],
+                },
+            ],
+        }
+
+    def scan(*args, **kwargs):
+        return [
+            row(_mod.TRUST_REL_DESCRIPTION),
+            row(_mod.TRUST_REL_DESCRIPTION + " copied by analyst"),
+            row(_mod.TRUST_REL_DESCRIPTION, "belongs-to"),
+        ]
+
+    monkeypatch.setattr(_mod, "scan", scan)
+
+    relationships = _mod.load_relationships("http://es", "relationships")
+
+    assert len(relationships) == 1
+
+
+def test_apply_rechecks_references_before_deleting_label(monkeypatch, capsys):
+    state = {
+        "labels": {"label-1": "trust-cluster:parent.example"},
+        "references": [],
+        "removals": [],
+        "plan": {},
+    }
+    deleted = []
+    monkeypatch.setenv("OPENCTI_URL", "http://opencti")
+    monkeypatch.setenv("OPENCTI_TOKEN", "token")
+    monkeypatch.setattr(_mod, "label_has_references", lambda *args: True)
+    monkeypatch.setattr(_mod, "delete_one", lambda *args: deleted.append(args))
+
+    assert _mod.apply(state, limit=None, workers=1) == 0
+    assert deleted == []
+    assert "protected_at_delete: 1" in capsys.readouterr().out
+
+
+def test_reference_check_failure_prevents_label_deletion(monkeypatch):
+    state = {
+        "labels": {"label-1": "trust-cluster:parent.example"},
+        "references": [],
+        "removals": [],
+        "plan": {},
+    }
+    deleted = []
+    monkeypatch.setenv("OPENCTI_URL", "http://opencti")
+    monkeypatch.setenv("OPENCTI_TOKEN", "token")
+    monkeypatch.setattr(
+        _mod, "label_has_references",
+        lambda *args: (_ for _ in ()).throw(RuntimeError("unavailable")),
+    )
+    monkeypatch.setattr(_mod, "delete_one", lambda *args: deleted.append(args))
+
+    assert _mod.apply(state, limit=None, workers=1) == 1
+    assert deleted == []

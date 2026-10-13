@@ -209,7 +209,7 @@ class IocTrustClusterConnector:
         self._stats: dict[str, int] = IocTrustClusterConnector._reset_stats()
 
         # Session caches — avoid redundant network calls for the same address / domain
-        self._cidr_cache: dict[str, str | None] = {}   # ip_str → RDAP CIDR string
+        self._cidr_cache: dict[str, str] = {}   # ip_str → RDAP CIDR string
         self._cidr_asn_cache: dict[str, tuple[str, str | None]] = {}  # CIDR → (ASN, owner)
         # Connector-owned CIDR→ASN edges form a bounded, per-session prefix
         # index. A peer IP can reuse the known chain without another RDAP call.
@@ -217,15 +217,14 @@ class IocTrustClusterConnector:
         self._known_cidr_prefixes: dict[int, set[int]] = {4: set(), 6: set()}
         self._known_cidrs_loaded = False
         self._known_cidr_limit_warned = False
-        self._asn_desc_cache: dict[str, str | None] = {}  # "AS{n}" → owner name
-        self._ns_cache: dict[str, str | None] = {}     # domain → primary NS hostname
+        self._asn_desc_cache: dict[str, str] = {}  # "AS{n}" → owner name
+        self._ns_cache: dict[str, str] = {}     # domain → primary NS hostname
         self._ip_cache: dict[str, list[str]] = {}      # domain → A record IP list
 
-        # Per-session dedup for analyst advisory notes — prevents duplicate notes
-        # across consecutive triggers.  Reset on container restart (acceptable:
-        # a single re-notification after restart is harmless).
-        self._revocation_noted: set[str] = set()   # entity IDs that received a revocation note
-        self._conflict_noted:   set[str] = set()   # entity IDs that received a conflict note
+        # Bounded per-session dedup for analyst advisory notes. Reset on cache
+        # overflow or container restart; a single re-notification is harmless.
+        self._revocation_noted: dict[str, None] = {}  # entity IDs with a revocation note
+        self._conflict_noted: dict[str, None] = {}    # entity IDs with a conflict note
 
     # ── DNS helpers ──────────────────────────────────────────────────────────────────────
 
@@ -234,7 +233,7 @@ class IocTrustClusterConnector:
         Return the primary authoritative NS hostname for a root domain.
 
         Queries public DNS for NS records and returns the first alphabetically
-        (for determinism across multi-NS delegations). Caches results. Guards
+        (for determinism across multi-NS delegations). Caches successful results. Guards
         against self-referential NS records that would create a cycle
         (e.g. evil.com NS ns1.evil.com → evil.com → ns1.evil.com → …).
         """
@@ -257,8 +256,8 @@ class IocTrustClusterConnector:
             if ns and _tld(ns).top_domain_under_public_suffix == domain:
                 ns = None
 
-            self._cache_set(self._ns_cache, domain, ns)
             if ns:
+                self._cache_set(self._ns_cache, domain, ns)
                 self.helper.log_debug(f"[trust-cluster] NS {domain} → {ns}")
             return ns
 
@@ -266,21 +265,20 @@ class IocTrustClusterConnector:
             self.helper.log_debug(
                 f"[trust-cluster] NS lookup failed for {domain}: {exc}"
             )
-            self._cache_set(self._ns_cache, domain, None)
             return None
 
     def _get_resolved_ips(self, domain: str) -> list[str]:
         """
         Return the IPv4 addresses that domain currently resolves to (A records).
-        Caches results to avoid repeated queries within the same connector session.
+        Caches successful results to avoid repeated queries within the same session.
         """
         if domain in self._ip_cache:
             return self._ip_cache[domain]
         try:
             answers = dns.resolver.resolve(domain, 'A', lifetime=self.ns_timeout)
             ips = [str(r.address) for r in answers]
-            self._cache_set(self._ip_cache, domain, ips)
             if ips:
+                self._cache_set(self._ip_cache, domain, ips)
                 self.helper.log_debug(
                     f"[trust-cluster] A {domain} → {', '.join(ips)}"
                 )
@@ -289,7 +287,6 @@ class IocTrustClusterConnector:
             self.helper.log_debug(
                 f"[trust-cluster] A lookup failed for {domain}: {exc}"
             )
-            self._cache_set(self._ip_cache, domain, [])
             return []
 
     # ── RDAP helpers ──────────────────────────────────────────────────────────────────────
@@ -428,7 +425,6 @@ class IocTrustClusterConnector:
         except Exception as e:
             self.helper.log_debug(f"[trust-cluster] RDAP failed for {ip_str}: {e}")
 
-        self._cache_set(self._cidr_cache, ip_str, None)
         return None
 
     def _get_asn_owner(self, asn_value: str) -> str | None:
@@ -506,7 +502,6 @@ class IocTrustClusterConnector:
                 f"after {attempt + 1} attempt(s): {last_exc}"
             )
 
-        self._cache_set(self._asn_desc_cache, cache_key, None)
         return None
 
     # ── TLS fingerprint helpers ────────────────────────────────────────────────────────────────
@@ -850,8 +845,8 @@ class IocTrustClusterConnector:
             return None
         return ('Domain-Name', pv)
 
-    def _trust_relationships(self, **kwargs) -> list[dict]:
-        """Return connector-owned structural parent edges."""
+    def _trust_relationships(self, **kwargs) -> list[dict] | None:
+        """Return connector-owned structural parent edges, or None on lookup failure."""
         rels: list[dict] = []
         seen: set[tuple[str | None, str | None]] = set()
         for rel_type in (TRUST_REL_TYPE,):
@@ -865,7 +860,7 @@ class IocTrustClusterConnector:
                 self.helper.log_warning(
                     f"[trust-cluster] relationship lookup failed ({rel_type}): {e}"
                 )
-                continue
+                return None
             for rel in found:
                 if TRUST_REL_DESCRIPTION not in (rel.get("description") or ""):
                     continue
@@ -877,11 +872,14 @@ class IocTrustClusterConnector:
                 rels.append(rel)
         return rels
 
-    def _trust_relationship_parents(self, child_id: str) -> list[dict]:
+    def _trust_relationship_parents(self, child_id: str) -> list[dict] | None:
         """Return parent observables from connector-created child→parent edges."""
+        relationships = self._trust_relationships(fromId=child_id)
+        if relationships is None:
+            return None
         parents: list[dict] = []
         seen_parent_ids: set[str] = set()
-        for rel in self._trust_relationships(fromId=child_id):
+        for rel in relationships:
             parent = rel.get("to") or rel.get("toEntity") or rel.get("target") or {}
             parent_id = parent.get("id") or rel.get("toId")
             if parent_id and (
@@ -895,7 +893,7 @@ class IocTrustClusterConnector:
                     self.helper.log_warning(
                         f"[trust-cluster] relationship parent read failed {parent_id}: {e}"
                     )
-                    continue
+                    return None
             if parent:
                 pid = parent.get("id") or parent_id
                 if pid in seen_parent_ids:
@@ -931,11 +929,14 @@ class IocTrustClusterConnector:
             return (*usable[0][:3], "UNKNOWN")
         return None
 
-    def _trust_relationship_children(self, parent_id: str) -> list[dict]:
+    def _trust_relationship_children(self, parent_id: str) -> list[dict] | None:
         """Return direct child observables from connector-created child→parent edges."""
+        relationships = self._trust_relationships(toId=parent_id)
+        if relationships is None:
+            return None
         children: list[dict] = []
         seen_child_ids: set[str] = set()
-        for rel in self._trust_relationships(toId=parent_id):
+        for rel in relationships:
             child = rel.get("from") or rel.get("fromEntity") or rel.get("source") or {}
             child_id = child.get("id") or rel.get("fromId")
             if child_id and ("x_opencti_score" not in child or "objectLabel" not in child):
@@ -1021,13 +1022,13 @@ class IocTrustClusterConnector:
                 rel_to_id = rel.get("toId") or (rel.get("to") or {}).get("id")
                 if rel_to_id == to_id:
                     return True
-            self.helper.api.stix_core_relationship.create(
+            created = self.helper.api.stix_core_relationship.create(
                 fromId=from_id, toId=to_id,
                 relationship_type=relationship_type,
                 description=description,
                 confidence=self.confidence,
             )
-            return True
+            return bool(created)
         except Exception as e:
             self.helper.log_warning(
                 f"[trust-cluster] relationship create failed: {e}"
@@ -1206,7 +1207,7 @@ class IocTrustClusterConnector:
                 if self._add_label(child_id, LABEL_INHERITED_MALICIOUS_CASCADE, COLOR_MALICIOUS):
                     labels.add(LABEL_INHERITED_MALICIOUS_CASCADE)
                     if self._has_fp_candidate_label(labels) and child_id not in self._conflict_noted:
-                        self._conflict_noted.add(child_id)
+                        self._cache_set(self._conflict_noted, child_id, None)
                         conflict = True
                         self._create_conflict_note(
                             child_id, child_label, p_type, p_value, p_score
@@ -1233,7 +1234,7 @@ class IocTrustClusterConnector:
 
         elif LABEL_MALICIOUS_CASCADE in labels:
             if child_id not in self._revocation_noted:
-                self._revocation_noted.add(child_id)
+                self._cache_set(self._revocation_noted, child_id, None)
                 self._create_revocation_note(
                     child_id, child_label, p_type, p_value, p_score
                 )
@@ -1288,7 +1289,9 @@ class IocTrustClusterConnector:
         has_malicious = self._has_malicious_context(entity)
         actions: list[str] = []
         _parent_verdict: str | None = None   # captured for stats
-        _conflict_this_trigger: bool = False  # captured for stats
+        _conflict_count = 0
+        fanout_changed = fanout_actions = fanout_conflicts = 0
+        fanout_malicious = fanout_fp = fanout_revoked = fanout_retracted = 0
 
         self.helper.log_info(
             f"[trust-cluster] {entity_type}:{value}  score={score}"
@@ -1310,8 +1313,11 @@ class IocTrustClusterConnector:
         relationship_verdict = None
         relationship_score = None
         stale_cluster = False
+        can_reconcile_inherited = True
 
         relationship_parents = self._trust_relationship_parents(entity_id)
+        if relationship_parents is None:
+            return "skipped: relationship resolution failed"
         if relationship_parents:
             # Relationships are the trust edges. Labels are only display/cache.
             reduced_parent = self._reduced_parent_verdict(relationship_parents, entity_type)
@@ -1374,34 +1380,40 @@ class IocTrustClusterConnector:
                     p_score  = relationship_score if relationship_score is not None else self._entity_score(parent)
                     p_labels = self._entity_label_values(parent)
 
-                    if p_type in {"IPv4-Addr", "IPv6-Addr"} and "/" in p_value:
-                        if self._ensure_cidr_asn_relationship(parent, p_value):
-                            actions.append(f"linked {p_type}:{p_value} to ASN")
-
+                    relationship_ready = already_clustered
                     if not already_clustered:
                         # Step 3: trust relationship child → parent (never reversed).
                         # No structural trust labels: parentage/trust is graph-only.
-                        if self._ensure_relationship(entity_id, p_id):
+                        relationship_ready = self._ensure_relationship(entity_id, p_id)
+                        if relationship_ready:
                             action = "repaired relationship to" if stale_cluster else "linked under"
                             actions.append(f"{action} {p_type}:{p_value}")
+                        else:
+                            can_reconcile_inherited = False
 
-                    # Step 5: verdict re-checked every trigger so parent score
-                    # changes propagate down to children on their next update.
-                    parent_verdict = relationship_verdict or self._classify_parent(p_score, p_labels)
-                    _parent_verdict = parent_verdict   # capture for stats
+                    if relationship_ready:
+                        if p_type in {"IPv4-Addr", "IPv6-Addr"} and "/" in p_value:
+                            if self._ensure_cidr_asn_relationship(parent, p_value):
+                                actions.append(f"linked {p_type}:{p_value} to ASN")
 
-                    verdict_actions, conflict = self._apply_parent_verdict_to_child(
-                        entity, p_type, p_value, p_score, parent_verdict, labels
-                    )
-                    actions.extend(verdict_actions)
-                    _conflict_this_trigger = _conflict_this_trigger or conflict
-                    if parent_verdict == "UNKNOWN":
-                        self.helper.log_debug(
-                            f"[trust-cluster] propagation stopped — "
-                            f"parent {p_type}:{p_value} is UNKNOWN (score={p_score})"
+                        # Step 5: verdict re-checked every trigger so parent score
+                        # changes propagate down to children on their next update.
+                        parent_verdict = relationship_verdict or self._classify_parent(p_score, p_labels)
+                        _parent_verdict = parent_verdict   # capture for stats
+
+                        verdict_actions, conflict = self._apply_parent_verdict_to_child(
+                            entity, p_type, p_value, p_score, parent_verdict, labels
                         )
+                        actions.extend(verdict_actions)
+                        _conflict_count += int(conflict)
+                        if parent_verdict == "UNKNOWN":
+                            self.helper.log_debug(
+                                f"[trust-cluster] propagation stopped — "
+                                f"parent {p_type}:{p_value} is UNKNOWN (score={p_score})"
+                            )
 
-        actions.extend(self._retract_unsupported_inherited_labels(entity, labels, _parent_verdict))
+        if can_reconcile_inherited:
+            actions.extend(self._retract_unsupported_inherited_labels(entity, labels, _parent_verdict))
 
         # ── Sinkhole check (Domain-Name only) ──────────────────────────────────────────────
         # Resolve the domain's A records and check against the configured sinkhole
@@ -1444,20 +1456,67 @@ class IocTrustClusterConnector:
         # ── Parent fanout: current observable → direct children ───────────────
         current_parent_info = self._parent_info_from_observable(entity, entity_type)
         if current_parent_info and current_parent_info[0] in RELATIONSHIP_TRUST_TYPES:
-            p_type, p_value = current_parent_info
             children = self._trust_relationship_children(entity_id)
-            parent_verdict = self._classify_parent(score, labels)
-            for child in children:
-                child_actions, conflict = self._apply_parent_verdict_to_child(
-                    child, p_type, p_value, score, parent_verdict
+            current_parent = {
+                **entity,
+                "objectLabel": [{"value": value} for value in labels],
+            }
+            for child in children or []:
+                child_id = child.get("id")
+                if not child_id:
+                    continue
+                child_parents = self._trust_relationship_parents(child_id)
+                if child_parents is None:
+                    continue
+                child_parents = [
+                    current_parent,
+                    *(parent for parent in child_parents if parent.get("id") != entity_id),
+                ]
+                reduced_parent = self._reduced_parent_verdict(
+                    child_parents, child.get("entity_type") or child.get("type")
                 )
-                actions.extend(child_actions)
-                _conflict_this_trigger = _conflict_this_trigger or conflict
+                child_labels = self._entity_label_values(child)
+                parent_verdict = reduced_parent[3] if reduced_parent else None
+                if reduced_parent:
+                    _, (p_type, p_value), p_score, _ = reduced_parent
+                    child_actions, conflict = self._apply_parent_verdict_to_child(
+                        child, p_type, p_value, p_score, parent_verdict, child_labels
+                    )
+                    fanout_conflicts += int(conflict)
+                    _conflict_count += int(conflict)
+                else:
+                    child_actions = []
+                retracted = self._retract_unsupported_inherited_labels(
+                    child, child_labels, parent_verdict
+                )
+                if child_actions or retracted:
+                    fanout_changed += 1
+                fanout_actions += len(child_actions) + len(retracted)
+                fanout_malicious += sum("malicious-cascade" in action for action in child_actions)
+                fanout_fp += sum("fp-candidate inherited" in action for action in child_actions)
+                fanout_revoked += sum("cascade-revocation" in action for action in child_actions)
+                fanout_retracted += len(retracted)
 
         # ── Step 7: Audit note ─────────────────────────────────────────────────
+        # Child advisory notes are created at the child. Do not attach fanout
+        # mutations to the triggering parent as if they changed the parent.
         self._create_audit_note(entity_id, f"{entity_type}:{value}", actions)
 
-        result = f"{len(actions)} action(s): {'; '.join(actions)}" if actions else "no actions"
+        result_actions = list(actions)
+        if fanout_actions:
+            result_actions.append(
+                f"fanout: children-changed={fanout_changed} "
+                f"malicious-cascade={fanout_malicious} "
+                f"fp-candidate inherited={fanout_fp} "
+                f"cascade-revocation={fanout_revoked} "
+                f"inherited-state-retracted={fanout_retracted} "
+                f"conflicts={fanout_conflicts}"
+            )
+        total_actions = len(actions) + fanout_actions
+        result = (
+            f"{total_actions} action(s): {'; '.join(result_actions)}"
+            if total_actions else "no actions"
+        )
         self.helper.log_info(f"[trust-cluster] {entity_type}:{value} → {result}")
 
         # ── Stats ───────────────────────────────────────────────────────────────────
@@ -1470,9 +1529,12 @@ class IocTrustClusterConnector:
                 if "sinkholed"              in action: self._stats["sinkholed"]          += 1
                 if "linked under"           in action: self._stats["newly_clustered"]    += 1
                 if "cascade-revocation"     in action: self._stats["cascade_revoked"]   += 1
-            if _conflict_this_trigger:             self._stats["cascade_conflict"]    += 1
+            self._stats["cascade_malicious"] += fanout_malicious
+            self._stats["cascade_fp"] += fanout_fp
+            self._stats["cascade_revoked"] += fanout_revoked
+            self._stats["cascade_conflict"] += _conflict_count
             if already_clustered:                  self._stats["already_clustered"] += 1
-            if not actions:                        self._stats["no_actions"]        += 1
+            if not total_actions:                  self._stats["no_actions"]        += 1
             if   _parent_verdict == "CONFIRMED_MALICIOUS": self._stats["parents_malicious"] += 1
             elif _parent_verdict == "CONFIRMED_BENIGN":    self._stats["parents_benign"]    += 1
             elif _parent_verdict == "UNKNOWN":             self._stats["parents_unknown"]   += 1
