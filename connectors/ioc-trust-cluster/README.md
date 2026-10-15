@@ -66,6 +66,21 @@ Implementation references: producer `81c81ec`; consumer `5cd7e849` (direct verdi
 
 Rollback only affected components: restore consumer files from pre-change `1acc6a9c` (or the recorded deployment baseline) and rerun read-only verification; restore the saved producer image with a temporary compose override `services.connector-ioc-trust-cluster.image: ioc-trust-cluster:pre-r2f` and `up -d --no-deps --no-build --pull never connector-ioc-trust-cluster`. Keep the override outside the repository. Rolling back the producer re-enables inheritance; leave all legacy data unchanged and do not run cleanup. Never roll back unrelated dirty files or erase evidence.
 
+## CIDR edge audit (read-only)
+
+The producer now checks same-family containment for IP/IPv6 and literal-IP URL parents, including existing edges, legacy hints, discovery and returned endpoints. A CIDR child must be wholly inside its parent, not merely share its first address. Invalid links are warned about and left unchanged for review; no automatic rediscovery, removal or repair. Independent direct heuristics remain active.
+
+```sh
+# Live read-only capture, using the existing pycti dependency and API credentials:
+python3 connectors/ioc-trust-cluster/scripts/audit_cidr_parent_edges.py \
+  --raw-file /tmp/cidr-edge-raw-NEW.json > /tmp/cidr-edge-review.json
+# Replay an existing capture without network access:
+python3 connectors/ioc-trust-cluster/scripts/audit_cidr_parent_edges.py \
+  --snapshot /tmp/cidr-edge-raw-NEW.json > /tmp/cidr-edge-review-replay.json
+```
+
+The scan covers all IP→IP relationship types, hydrates current endpoints via OpenCTI rather than trusting cached search-index names, and checks whole-network containment. Raw pages are saved before assessment, never overwritten. Paging is capped at 100 pages × 100 rows by default; partial/failed scans or unassessable endpoints exit `2`. A complete scan exits `0` even with findings: inspect `invalid_count`, not just exit status. There is no apply mode, RDAP lookup, paid enrichment or ownership inference from a marker. See [the dft audit and approval-gated repair proposal](../../docs/decisions/cidr-parent-edge-audit-20261015.md).
+
 ## Legacy migrations (separate approvals)
 
 `cleanup_structural_labels.py` removes a different obsolete structural-label class and explicitly protects both inherited-state labels; do not relax those safeguards. `migrate_unknown_anchor_scores.py` is a separate score-50 anchor migration with its own dry-run/apply/verify guards. Neither is run by this rollout.

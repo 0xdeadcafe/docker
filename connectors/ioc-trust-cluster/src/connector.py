@@ -291,8 +291,8 @@ class IocTrustClusterConnector:
         Return the ASN-announced CIDR block for a public IP/IPv6 address via RDAP.
 
         Both IPv4 and IPv6 are supported — ipwhois handles the full RFC 3596
-        address space.  Private / special-purpose addresses are skipped; the
-        caller falls back to a computed prefix for those.
+        address space. Private / special-purpose addresses are skipped;
+        no computed fallback prefix is created.
 
         Side-effect: caches the ASN description in self._asn_desc_cache so that
         a subsequent Autonomous-System observable for the same ASN can be grouped
@@ -705,6 +705,30 @@ class IocTrustClusterConnector:
         value = value or parent.get("value") or parent.get("observable_value")
         return (p_type, value) if p_type and value else None
 
+    def _valid_cidr_parent(self, child_type: str, value: str, parent_info) -> bool:
+        """Containment is required even for existing edges and legacy label hints."""
+        if not parent_info:
+            return False
+        p_type, p_value = parent_info
+        if p_type not in {"IPv4-Addr", "IPv6-Addr"} or "/" not in p_value:
+            return True
+        if child_type == "Url":
+            value = urlparse(value).hostname or ""
+        elif child_type not in {"IPv4-Addr", "IPv6-Addr"}:
+            return True
+        try:
+            child = ipaddress.ip_network(value, strict=False)
+            parent = ipaddress.ip_network(p_value, strict=False)
+            if child.version == parent.version and child.subnet_of(parent):
+                return True
+        except ValueError:
+            pass
+        self.helper.log_warning(
+            f"[trust-cluster] invalid CIDR parent {value} -> {p_value}; "
+            "not reused or recreated; stored data left unchanged for review"
+        )
+        return False
+
     @staticmethod
     def _parent_info_from_cluster_label(child_type: str, label: str):
         if label in INHERITED_STATE_LABELS:
@@ -1003,6 +1027,9 @@ class IocTrustClusterConnector:
             parent_info = self._extract_parent(entity_type, value, entity)
             already_clustered = False
 
+        if not self._valid_cidr_parent(entity_type, value, parent_info):
+            parent_info = None
+
         if parent_info:
             p_type, p_value = parent_info
 
@@ -1032,6 +1059,12 @@ class IocTrustClusterConnector:
                 else:
                     parent = self._find_or_create_parent(p_type, p_value)
 
+                # Validate the returned endpoint too: a lookup may resolve a
+                # different observable than the requested discovery/label hint.
+                if parent and not self._valid_cidr_parent(
+                    entity_type, value, self._parent_info_from_observable(parent)
+                ):
+                    parent = None
                 if parent:
                     p_id = parent["id"]
                     relationship_ready = already_clustered
