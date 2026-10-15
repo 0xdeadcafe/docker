@@ -409,6 +409,28 @@ services:
       opencti:
         condition: service_healthy
 
+  connector-urlhaus:
+    image: opencti/connector-urlhaus:7.260910.0
+    environment:
+      - OPENCTI_URL=http://opencti:8080
+      - OPENCTI_TOKEN=${OPENCTI_ADMIN_TOKEN}
+      - CONNECTOR_ID=${CONNECTOR_URLHAUS_ID:-cb83dadc-8b09-4943-a095-21b18dcb132c}
+      - CONNECTOR_TYPE=EXTERNAL_IMPORT
+      - CONNECTOR_NAME=URLhaus
+      - CONNECTOR_SCOPE=urlhaus
+      - CONNECTOR_LOG_LEVEL=info
+      - CONNECTOR_DURATION_PERIOD=PT3H
+      - URLHAUS_CSV_URL=https://urlhaus.abuse.ch/downloads/csv_recent/
+      - URLHAUS_DEFAULT_X_OPENCTI_SCORE=80
+      - URLHAUS_IMPORT_OFFLINE=true
+      - URLHAUS_THREATS_FROM_LABELS=false
+    mem_limit: 512m
+    cpus: 1.0
+    restart: always
+    depends_on:
+      opencti:
+        condition: service_healthy
+
   connector-alienvault:
     image: opencti/connector-alienvault:latest
     environment:
