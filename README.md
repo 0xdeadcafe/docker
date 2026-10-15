@@ -4,9 +4,35 @@
 
 You can find the detailed documentation about the Docker installation in the [OpenCTI documentation space](https://docs.opencti.io/latest/deployment/installation/#using-docker).
 
+## Native enrichment configuration
+
+AbuseIPDB, IPQS, and VirusTotal use the pinned upstream connector images, without local patches. All three set `CONNECTOR_AUTO=false` and `CONNECTOR_AUTO_UPDATE=false`. AbuseIPDB uses a native trigger filter for automatic host-only enrichment; IPQS and VirusTotal remain on demand.
+
+### AbuseIPDB: exclude CIDRs from automatic enrichment
+
+In **Data → Ingestion → Connectors → AbuseIPDB → Trigger filters**, set **Representative → does not contain → `/`**. The equivalent `connector_trigger_filters` value is:
+
+```json
+{"mode":"and","filters":[{"key":["representative"],"values":["/"],"operator":"not_contains","mode":"or"}],"filterGroups":[]}
+```
+
+OpenCTI 7.260910.0 uses configured trigger filters instead of `auto` for creation-time enrichment, while still enforcing `CONNECTOR_SCOPE=IPv4-Addr`. This allows individual IPv4 addresses but excludes CIDR anchors. With no filter, AbuseIPDB stays on demand rather than automatically querying networks. The filter is stored in OpenCTI, survives connector recreation, and must be configured again in a fresh platform database.
+
+Keep **Trigger filters empty** on IPQS and VirusTotal: filters can enable automatic enrichment even with `CONNECTOR_AUTO=false`. Do not route these providers through automatic playbooks if they must remain on demand.
+
+Trigger filters do not restrict explicit UI/GraphQL requests or remove already queued work. Do not manually request CIDR enrichment. Upstream images no longer include our custom CIDR skips, quota circuits, five-minute duplicate suppression, IPQS error patches, or custom outcome/readiness metrics. Repeated explicit requests can consume quota; provider failures follow upstream behavior. Standard connector metrics remain enabled for IPQS and VirusTotal.
+
+To replace the patched images on an existing deployment, configure the AbuseIPDB filter first, then recreate only these services:
+
+```bash
+docker compose up -d --no-deps connector-abuseipdb connector-ipqs connector-virustotal
+```
+
+See the official [enrichment documentation](https://docs.opencti.io/latest/usage/enrichment/).
+
 ## VirusTotal and IPQS enrichment
 
-VirusTotal and IPQS are paid, on-demand enrichment connectors. They stay running with `CONNECTOR_AUTO=false`; importing an observable does not call either provider. An authorized user must select a connector in the OpenCTI UI or request it through GraphQL. IPQS handles IPv4 addresses, domains, and URLs. VirusTotal handles files, artifacts, IPv4 addresses, domains, and URLs; unseen URL submission remains disabled.
+VirusTotal and IPQS are paid, on-demand enrichment connectors. They stay running with automatic triggers disabled as described above; importing an observable does not call either provider. An authorized user must select a connector in the OpenCTI UI or request it through GraphQL. IPQS handles IPv4 addresses, domains, and URLs. VirusTotal handles files, artifacts, IPv4 addresses, domains, and URLs; unseen URL submission remains disabled.
 
 ### One-time rollout
 
@@ -18,7 +44,7 @@ set -a; source .env; set +a
 docker compose stop connector-ipqs connector-virustotal
 docker compose exec rabbitmq rabbitmqctl purge_queue "listen_${CONNECTOR_IPQS_ID}"
 docker compose exec rabbitmq rabbitmqctl purge_queue "listen_${CONNECTOR_VIRUSTOTAL_ID}"
-docker compose up -d --build --force-recreate connector-ipqs connector-virustotal
+docker compose up -d --no-deps --force-recreate connector-ipqs connector-virustotal
 
 docker compose exec rabbitmq rabbitmqctl list_queues \
   name messages_ready messages_unacknowledged | \
@@ -45,25 +71,6 @@ JSON
 ```
 
 A successful response contains the created work ID under `data.stixCoreObjectEdit.askEnrichment.id`.
-
-### Quota circuit and usage metrics
-
-IPQS insufficient-credit/HTTP 429 responses and VirusTotal HTTP 429 responses open an in-process provider circuit. While open, requested work completes with an actionable cooldown error and makes no provider call. The default cooldown is one hour, bounded to 24 hours; provider `Retry-After` headers take precedence within that bound.
-
-Configure cooldowns with `IPQS_QUOTA_COOLDOWN_SECONDS`, `VIRUSTOTAL_QUOTA_COOLDOWN_SECONDS`, and `ENRICHMENT_QUOTA_MAX_COOLDOWN_SECONDS`. Normal enrichment resumes automatically when the cooldown expires. After confirming quota recovery, an operator can reset immediately by restarting only that connector:
-
-```bash
-docker compose restart connector-ipqs       # or connector-virustotal
-```
-
-Each connector exposes Prometheus metrics on its internal port `9095`. `opencti_enrichment_requests_total` is labelled by `provider`, `observable_type`, and `outcome` (`requested`, `executed`, `skipped`, `successful`, `failed`, or `quota_blocked`) and never contains observable values or credentials. `opencti_url_reputation_provider_ready` is `1` only when that provider has `Url` scope and its quota circuit is closed: two ready providers is healthy, one is degraded, and zero means URL reputation is unavailable. Inspect metrics without publishing a host port:
-
-```bash
-docker compose exec connector-ipqs python -c \
-  'import urllib.request; print(urllib.request.urlopen("http://localhost:9095/metrics").read().decode())'
-```
-
-OpenCTI accepts duplicate explicit UI/GraphQL requests as separate work items, so each provider also skips the same OpenCTI object for five minutes after an executed request. Configure that window with `IPQS_RECENT_ENRICHMENT_SECONDS` or `VIRUSTOTAL_RECENT_ENRICHMENT_SECONDS`; restarting the connector clears it.
 
 ## XTM One
 

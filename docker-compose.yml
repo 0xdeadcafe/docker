@@ -314,19 +314,17 @@ services:
   ###########################
 
   connector-abuseipdb:
-    build:
-      context: ./connectors/cidr-enrichment-filter
-      args:
-        BASE_IMAGE: opencti/connector-abuseipdb:7.260910.0
-        CIDR_FILTER_CONNECTOR: abuseipdb
-    image: local/connector-abuseipdb-cidr-filter:latest
+    image: opencti/connector-abuseipdb:7.260910.0
     environment:
       - OPENCTI_URL=http://opencti:8080
       - OPENCTI_TOKEN=${OPENCTI_ADMIN_TOKEN}
       - CONNECTOR_ID=${CONNECTOR_ABUSEIPDB_ID}
       - CONNECTOR_NAME=AbuseIPDB
       - CONNECTOR_SCOPE=IPv4-Addr
-      - CONNECTOR_AUTO=true
+      # Native trigger filter enables host-only automatic enrichment (see README).
+      # Fail closed on fresh installs until that filter is configured in OpenCTI.
+      - CONNECTOR_AUTO=false
+      - CONNECTOR_AUTO_UPDATE=false
       - CONNECTOR_CONFIDENCE_LEVEL=80
       - ABUSEIPDB_MAX_AGE_DAYS=${ABUSEIPDB_MAX_AGE_DAYS:-30}
       - ABUSEIPDB_API_KEY=${ABUSEIPDB_API_KEY}
@@ -337,12 +335,7 @@ services:
         condition: service_healthy
 
   connector-ipqs:
-    build:
-      context: ./connectors/cidr-enrichment-filter
-      args:
-        BASE_IMAGE: opencti/connector-ipqs:7.260910.0
-        CIDR_FILTER_CONNECTOR: ipqs
-    image: local/connector-ipqs-cidr-filter:latest
+    image: opencti/connector-ipqs:7.260910.0
     environment:
       - OPENCTI_URL=http://opencti:8080
       - OPENCTI_TOKEN=${OPENCTI_ADMIN_TOKEN}
@@ -352,13 +345,11 @@ services:
       - CONNECTOR_SCOPE=IPv4-Addr,Domain-Name,Url
       # Paid enrichment is user-requested through OpenCTI UI/GraphQL only.
       - CONNECTOR_AUTO=false
+      - CONNECTOR_AUTO_UPDATE=false
       - CONNECTOR_CONFIDENCE_LEVEL=80
       - CONNECTOR_EXPOSE_METRICS=true
       - CONNECTOR_METRICS_NAMESPACE=opencti
       - CONNECTOR_METRICS_SUBSYSTEM=ipqs
-      - IPQS_QUOTA_COOLDOWN_SECONDS=${IPQS_QUOTA_COOLDOWN_SECONDS:-3600}
-      - IPQS_RECENT_ENRICHMENT_SECONDS=${IPQS_RECENT_ENRICHMENT_SECONDS:-300}
-      - ENRICHMENT_QUOTA_MAX_COOLDOWN_SECONDS=${ENRICHMENT_QUOTA_MAX_COOLDOWN_SECONDS:-86400}
       - IPQS_PRIVATE_KEY=${IPQS_API_KEY}
       - IPQS_MAX_TLP=TLP:AMBER
       - IPQS_IP_ADD_RELATIONSHIPS=false
@@ -386,29 +377,22 @@ services:
         condition: service_healthy
 
   connector-virustotal:
-    build:
-      context: ./connectors/cidr-enrichment-filter
-      args:
-        BASE_IMAGE: opencti/connector-virustotal:7.260910.0
-        CIDR_FILTER_CONNECTOR: virustotal
-    image: local/connector-virustotal-cidr-filter:latest
+    image: opencti/connector-virustotal:7.260910.0
     environment:
       - OPENCTI_URL=http://opencti:8080
       - OPENCTI_TOKEN=${OPENCTI_ADMIN_TOKEN}
       - CONNECTOR_ID=${CONNECTOR_VIRUSTOTAL_ID}
       - CONNECTOR_NAME=VirusTotal
-      # URL lookups provide fallback reputation when IPQS is quota-blocked.
+      # URL lookups provide an on-demand alternative when IPQS is unavailable.
       # Uploads remain disabled, so unseen URLs are never submitted to VT.
       - CONNECTOR_SCOPE=StixFile,Artifact,IPv4-Addr,Domain-Name,Url
       # Paid enrichment is user-requested through OpenCTI UI/GraphQL only.
       - CONNECTOR_AUTO=false
+      - CONNECTOR_AUTO_UPDATE=false
       - CONNECTOR_CONFIDENCE_LEVEL=75
       - CONNECTOR_EXPOSE_METRICS=true
       - CONNECTOR_METRICS_NAMESPACE=opencti
       - CONNECTOR_METRICS_SUBSYSTEM=virustotal
-      - VIRUSTOTAL_QUOTA_COOLDOWN_SECONDS=${VIRUSTOTAL_QUOTA_COOLDOWN_SECONDS:-3600}
-      - VIRUSTOTAL_RECENT_ENRICHMENT_SECONDS=${VIRUSTOTAL_RECENT_ENRICHMENT_SECONDS:-300}
-      - ENRICHMENT_QUOTA_MAX_COOLDOWN_SECONDS=${ENRICHMENT_QUOTA_MAX_COOLDOWN_SECONDS:-86400}
       - VIRUSTOTAL_TOKEN=${VT_API_KEY}
       - VIRUSTOTAL_MAX_TLP=TLP:AMBER
       - VIRUSTOTAL_REPLACE_WITH_LOWER_SCORE=true
