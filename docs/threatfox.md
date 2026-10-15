@@ -22,7 +22,9 @@ docker compose -p xtm -f docker-compose.yml up -d --no-deps --no-build connector
 docker compose -p xtm -f docker-compose.yml stop connector-threatfox
 ```
 
-This change configures and pulls the image but **does not start it**. URLhaus already had roughly 79,000 queued objects during review. A later unscoped `docker compose up` will include ThreatFox. Imported direct IPs are eligible for the existing automatic AbuseIPDB host filter and can consume quota; VT/IPQS remain on demand. Do not purge shared queues or disable unrelated connectors to validate this feed.
+Started on **2026-10-15 at 19:55:07 UTC** after explicit operator approval, using only `up -d --no-deps --no-build --pull never connector-threatfox`. The first collection queued **30,448 STIX objects** (not unique IOCs) and finished sending at 19:56:24 UTC; worker backfill continues asynchronously. Native API verification observed 156 source-attributed indicators, with sampled confidence 100 and score 50, an active connector, zero connector errors/restarts and no OOM. Existing `xtm` container IDs were unchanged.
+
+Imported direct IPs are eligible for the existing automatic AbuseIPDB host filter and can consume quota; VT/IPQS remain on demand. No manual provider enrichment was requested for validation. Do not purge shared queues or disable unrelated connectors to validate this feed.
 
 ## Freshness and upstream limitations
 
@@ -32,4 +34,4 @@ The provider's definition of "recent" is not a first-seen age bound. The 2026-10
 
 The stock converter parses but **does not persist first/last-seen timestamps or the ThreatFox record ID/link**; an optional source reference is not necessarily a ThreatFox record link. Its first-seen watermark skips later updates to older records. SHA-1 indicators use `hashes.SHA1` rather than the observable's `SHA-1` key; SHA-256 conversion is checked explicitly. IPv6 `ip:port` conversion is not supported. There is no hard download timeout/size/row cap or per-row failure isolation. The importer catches errors and can still log "success"/advance state, so inspect errors and actual ingestion before accepting a run.
 
-These are documented upstream limitations, not patched or claimed fixed. Structured consumer ThreatFox verdict/freshness normalization and a production positive/benign hash smoke without VT remain unverified. ThreatFox only covers hashes it lists; it is not complete MalwareBazaar coverage. `open-cti-bgt` remains blocked on live validation and disposition of the original metadata/freshness requirements; the stock Compose configuration is delivered, not claimed to meet all original acceptance criteria.
+These are documented upstream limitations, not patched or claimed fixed. Source-attributed indicators are verified live, but structured consumer ThreatFox verdict/freshness normalization and the full positive/benign hash comparison without VT remain unverified. ThreatFox only covers hashes it lists; it is not complete MalwareBazaar coverage. `open-cti-bgt` remains blocked on the remaining comparison and disposition of the original metadata/freshness requirements; the stock connector is deployed, not claimed to meet all original acceptance criteria.
