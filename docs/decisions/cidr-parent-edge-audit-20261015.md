@@ -1,5 +1,7 @@
 # CIDR parent edge audit — open-cti-dft
 
+**Current state (2026-10-15): approved two-edge pilot completed at 17:18Z; 35 invalid edges remain outside approval.** See the pilot result below; earlier sections retain the pre-repair evidence.
+
 ## Findings (read-only, 2026-10-15)
 
 At **15:10:54Z**, a complete bounded native-API scan returned **1,030 IP→IP edges** (11 pages, stable exact counts, distinct IDs), all `related-to` with CIDR targets. Current hydrated endpoints—not cached Elasticsearch connection names—show **993 contained, 37 invalid**. These comprise **36 host children and one CIDR child**, referencing **20 parent networks**. There were no malformed/unavailable endpoints. This is a paginated observation, not a transactional database snapshot; refresh before any repair.
@@ -49,7 +51,7 @@ A fresh live audit through `http://opencti:8080` verified **identical decoded JS
 
 Rollback: prior image `sha256:568dc78e4696b5fc27fc697bf9aba84eeaecb0f836f6ea6bceaf12ed27eef6df` retained as **`ioc-trust-cluster:pre-dft`**. If needed, use an external temporary compose override setting only `services.connector-ioc-trust-cluster.image` to that tag, then `docker compose -p xtm -f docker-compose.yml -f /tmp/dft-rollback.yml up -d --no-deps --no-build --pull never connector-ioc-trust-cluster`. This rolls back code only; no data rollback is currently necessary. Unrelated OpenCTI and ShellShock worktree diffs remained byte-identical to their pre-task snapshots.
 
-## Review manifest and bounded repair proposal — NOT APPROVED
+## Original review manifest and bounded repair proposal (pre-approval record)
 
 - **37 mathematically invalid edges** are review items, not authenticated connector-owned deletion candidates. The report has `mutation_authorized=false`, `apply_limit=0`. No apply tool was built or run.
 - Recommended first batch: **at most two edges**, `193e497d-b8b0-4db7-9d6e-332b766dfae6` and `239b8e1c-5ef8-434f-a0b4-df1e24f04ca5`, corresponding to the original examples above. Operator must explicitly authorize disposition despite missing author attribution. The remaining 35 require a separately bounded approved batch.
@@ -58,7 +60,44 @@ Rollback: prior image `sha256:568dc78e4696b5fc27fc697bf9aba84eeaecb0f836f6ea6bce
 - **Rollback export exists for all 37**. Restore semantic relationships using the exported standard STIX ID, original endpoint IDs, relationship type, description, confidence, dates and other supported metadata via OpenCTI. Internal UUIDs and platform creation timestamps may change; references must be reassociated if any appear. Do not claim byte-identical restoration. Validate this restore in an **explicitly approved disposable scope with automatic enrichment suppressed** before approving production removal; no live rollback mutation has been tested or needed so far.
 - After an approved batch: reread direct evidence and graph/reference state, verify unrelated data unchanged, account for applied/skipped/errors, then restart the same guarded writer image. Preserve raw evidence and old edges' exports. No paid provider validation.
 
-**Decision pending:** operator approval of the pilot and rollback validation scope. No destructive action is authorized by this audit. Responsible operator: `nick@vectra.ai` (bead owner).
+**Decision at proposal time (superseded by the pilot result below):** operator approval of the pilot and rollback validation scope. No destructive action is authorized by this audit. Responsible operator: `nick@vectra.ai` (bead owner).
+
+## Approved two-edge pilot — completed 2026-10-15
+
+The operator's **“yes repair”** approved the previously proposed **two-ID pilot**, including isolated rollback validation, despite unproven historical writer attribution. It did not authorize the other 35. Fresh native inventory still showed 1,030 edges / 37 invalid; fresh free RDAP returned 2/2 HTTP 200 containing allocations. The exact two full native SDK relationship records, four current endpoints (including Note content), and zero dependent Notes/Reports/core relationships were exported before mutation. Platform identity: `2abd4223-fead-4829-9566-957ad965cf02`, version `7.260910.0`.
+
+| Removed relationship ID | Pair | API deletion UTC |
+|---|---|---|
+| `193e497d-b8b0-4db7-9d6e-332b766dfae6` | `18.214.199.100` → `18.32.0.0/11` | `17:18:12.977Z` |
+| `239b8e1c-5ef8-434f-a0b4-df1e24f04ca5` | `35.138.131.221` → `35.129.0.0/16` | `17:18:13.227Z` |
+
+**Production apply: 2 applied, 0 skipped, 0 errors. No replacement observables or edges were created.** No parent observable, ASN ownership edge, label, definition, score or historical Note was targeted for deletion or alteration.
+
+### Restore validation and safety boundaries
+
+Before either live deletion, a **native draft workspace, never published**, held a nonce-marked disposable `related-to` relationship between two existing endpoint objects. No SCO fixture was created. Automatic update enrichment was false on every internal enrichment connector; none of the configured automatic scopes matched `related-to` / core relationships, and the graph writer was stopped. Native create → read → delete → restore → read preserved the standard STIX ID, direction/endpoints, relationship type, description, confidence, language, revocation and semantic timestamps. The **internal UUID changed**, as anticipated. This proves the exported semantic restore in isolated draft scope, **not byte-identical database restoration or a live production restore**.
+
+Preparation caught incompatible host pycti/FastAPI dependencies and the SDK's identity-only create response. The pinned deployed SDK was used in a `--rm` utility process, without registering a connector or saving credentials; full reads were added before comparing restored records. An initial isolated rehearsal aborted before any live edge deletion and its draft was discarded. Both rehearsal workspaces are now absent. **17 archived offline pilot/export checks pass**, including stale/changed metadata, out-of-scope IDs and the identity-only SDK response.
+
+### Post-apply proof
+
+- Immediate and post-writer-resume complete inventories agree: **1,028 edges = 993 contained + 35 invalid** (34 host children, one CIDR child). Every other IP relationship/endpoint record is identical to the pre-apply snapshot as decoded JSON, apart from the two explicitly removed records.
+- All four endpoint snapshots, including labels, scores, markings, reports, references and full bounded Note content, are identical before/after. Historical evidence is retained.
+- Both IOCs were checked read-only: the removed IDs are absent from parent/related context, and direct verdict/source/cache evidence remains equal using the **same pinned consumer source** (`fd54fc94`) as the earlier baseline. Concurrent consumer source-freshness changes were not mistaken for data changes; saved native responses were reused locally rather than re-querying to adjust filtering.
+- Only IOC Trust Cluster was paused/resumed. Same container/image `02311d24`, same connector identity; it resumed at **17:18:15Z**, loaded the same **274 ASN-backed anchors**, and ready/unacknowledged counts are **0/0** before/after. The workbench stayed stopped. No paid enrichment or replacement discovery was invoked.
+
+### Evidence and rollback
+
+Private artifact root: **`/home/x0r/.local/state/open-cti/dft-pilot-20261015/`** (directories 0700, files 0600). The successful batch is `apply-pilot-verified/`; all preparatory attempts are retained separately.
+
+- `apply-pilot-verified/rollback-export.json` — SHA-256 `259dd62aa9c64f7a42463b44af1dba3d67f7b792e33bca71d326fbb34d88e00e`.
+- `apply-pilot-verified/restore-proof.json` — SHA-256 `bde99a141cad1068c192bec868da26407d81e72439d66812bdcd4cc28fc3b74d`.
+- `dft-pilot-after-resume-raw.json` — SHA-256 `707b891b00997bba1bf6b51ebf4915e0b7dec2c527ed8b999b66f568570a5b7c`.
+- `dft-pilot-verification.json`, native API journals, fresh RDAP, four endpoint snapshots, consumer proof, queue/runtime logs, `dft-pilot-repair.py`, SDK runner and runnable `test_dft_pilot.py` accompany these exports.
+
+No data rollback was required. If explicitly rolling this batch back, pause the same writer and verify the exported platform identity, original endpoint IDs, unchanged metadata and current references first. Using the healthy deployed SDK, load the archived `dft-pilot-repair.py` and call its tested **`restore(api, record)`** for **only** the two `rollback-export.json` relationship records. The helper re-reads and checks exported semantic fields; it refuses nonempty author/label/marking/reference/organization/workflow metadata rather than dropping it. Record new internal IDs, reassociate any newly introduced references, and reverify direct evidence before resuming. Do **not** restore known-bad edges just to retest this proof.
+
+**Remaining decision:** `remaining-35-review.json` contains the exact refreshed IDs/pairs for a proposed separate batch of at most 35, with `mutation_authorized=false` and `apply_limit=0`. It requires new explicit approval and refreshed full exports, endpoint/reference/RDAP checks before any action. `open-cti-dft` stays blocked on that disposition; this pilot does not authorize further cleanup.
 
 ## Evidence
 
