@@ -431,6 +431,31 @@ services:
       opencti:
         condition: service_healthy
 
+  connector-threatfox:
+    image: opencti/connector-threatfox:7.260910.0
+    environment:
+      - OPENCTI_URL=http://opencti:8080
+      - OPENCTI_TOKEN=${OPENCTI_ADMIN_TOKEN}
+      - CONNECTOR_ID=${CONNECTOR_THREATFOX_ID:-e5bcd93d-41ce-44d2-87d7-738c00713a7e}
+      - CONNECTOR_TYPE=EXTERNAL_IMPORT
+      - CONNECTOR_NAME=ThreatFox
+      - CONNECTOR_SCOPE=threatfox
+      - CONNECTOR_LOG_LEVEL=info
+      # This release uses THREATFOX_INTERVAL in whole days, not CONNECTOR_DURATION_PERIOD.
+      - THREATFOX_INTERVAL=1
+      - THREATFOX_CSV_URL=https://threatfox.abuse.ch/export/csv/recent/
+      - THREATFOX_IOC_TO_IMPORT=all_types
+      - THREATFOX_IMPORT_OFFLINE=true
+      - THREATFOX_CREATE_INDICATORS=true
+      # Source confidence stays metadata; do not turn it into a malicious score.
+      - THREATFOX_DEFAULT_X_OPENCTI_SCORE=50
+    mem_limit: 512m
+    cpus: 1.0
+    restart: always
+    depends_on:
+      opencti:
+        condition: service_healthy
+
   connector-alienvault:
     image: opencti/connector-alienvault:latest
     environment:
