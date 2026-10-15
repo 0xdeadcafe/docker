@@ -80,7 +80,11 @@ services:
   ###########################
   
   opencti:
-    image: opencti/platform:latest
+    image: local/opencti-platform-work-id-guard:7.260910.0
+    build:
+      context: ./platform/work-id-guard
+      args:
+        BASE_IMAGE: opencti/platform:7.260910.0
     environment:
       - NODE_OPTIONS=--max-old-space-size=8096
       - APP__PORT=8080
@@ -126,7 +130,7 @@ services:
       timeout: 5s
       retries: 20
   worker:
-    image: opencti/worker:latest
+    image: opencti/worker:7.260910.0
     environment:
       - OPENCTI_URL=http://opencti:8080
       - OPENCTI_TOKEN=${OPENCTI_ADMIN_TOKEN}
@@ -320,8 +324,7 @@ services:
       - OPENCTI_TOKEN=${OPENCTI_ADMIN_TOKEN}
       - CONNECTOR_ID=${CONNECTOR_ABUSEIPDB_ID}
       - CONNECTOR_NAME=AbuseIPDB
-      - CONNECTOR_SCOPE=IPv4-Addr
-      # Native trigger filter enables host-only automatic enrichment (see README).
+      - CONNECTOR_SCOPE=IPv4-Addr,IPv6-Addr
       # Fail closed on fresh installs until that filter is configured in OpenCTI.
       - CONNECTOR_AUTO=false
       - CONNECTOR_AUTO_UPDATE=false
@@ -385,7 +388,7 @@ services:
       - CONNECTOR_NAME=VirusTotal
       # URL lookups provide an on-demand alternative when IPQS is unavailable.
       # Uploads remain disabled, so unseen URLs are never submitted to VT.
-      - CONNECTOR_SCOPE=StixFile,Artifact,IPv4-Addr,Domain-Name,Url
+      - CONNECTOR_SCOPE=StixFile,Artifact,IPv4-Addr,IPv6-Addr,Domain-Name,Url
       # Paid enrichment is user-requested through OpenCTI UI/GraphQL only.
       - CONNECTOR_AUTO=false
       - CONNECTOR_AUTO_UPDATE=false
