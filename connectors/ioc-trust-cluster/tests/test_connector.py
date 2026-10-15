@@ -6,16 +6,14 @@ Comprehensive test suite for connectors/ioc-trust-cluster/src/connector.py
 Coverage map
 ────────────
   ① _extract_tls_profile       JA4/JA4S profile extraction vs JA3/JA4X no-ops
-  ② _classify_parent           three-state verdict logic (all boundary conditions)
+  ② legacy state parsing      inherited labels are not structural hints
   ③ _extract_parent            all supported observable types + edge cases
   ④ _get_announced_cidr        RDAP lookup, caching, side-effects, fallback paths
   ⑤ _get_asn_owner             RDAP ASN resolution, cache hits, failure paths
   ⑥ process_message            full pipeline:
        • CIDR parent creation + child→parent relationship
-       • cluster label applied to both child and parent
-       • trust propagation — malicious-cascade DOWN from confirmed CIDR
-       • trust propagation — fp-candidate DOWN from benign CIDR
-       • cascaded parent (malicious-cascade label) stops further propagation
+       • no copied parent verdicts, no child fanout or label retraction
+       • existing inherited/manual state remains untouched
        • label-only path — ASN owner cluster label
        • label-only path — TLS profile cluster label
        • ubiquity heuristic (sightings threshold)
@@ -70,7 +68,6 @@ from connector import (
     ASN_REL_DESCRIPTION,
     COLOR_CLUSTER,
     COLOR_FP,
-    COLOR_MALICIOUS,
     COLOR_SINKHOLED,
 )
 
@@ -88,7 +85,6 @@ _ENV_BASE = {
     "TRUST_CLUSTER_MALICIOUS_SCORE_MIN":   "70",
     "TRUST_CLUSTER_FP_SIGHTING_THRESHOLD": "10",
     "TRUST_CLUSTER_UNKNOWN_SCORE_MAX":     "50",
-    "TRUST_CLUSTER_FP_CASCADE_SCORE_MAX":  "50",      # explicit default — matches UNKNOWN_SCORE_MAX
     "TRUST_CLUSTER_CIDR_FALLBACK_PREFIX":  "24",
     "TRUST_CLUSTER_IPV6_FALLBACK_PREFIX":  "48",
     "TRUST_CLUSTER_RDAP_TIMEOUT":          "5",
@@ -225,61 +221,13 @@ class TestExtractTlsProfile:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ② _classify_parent
+# ② Legacy state parsing
 # ══════════════════════════════════════════════════════════════════════════════
 
-class TestClassifyParent:
-    """Three-state verdict — pure logic, no I/O."""
-
-    @pytest.fixture(autouse=True)
-    def con(self):
-        self.c = _make_connector()
-
-    def test_high_score_no_labels_is_confirmed_malicious(self):
-        assert self.c._classify_parent(80, set()) == "CONFIRMED_MALICIOUS"
-
-    def test_score_at_threshold_is_confirmed_malicious(self):
-        assert self.c._classify_parent(70, set()) == "CONFIRMED_MALICIOUS"
-
-    def test_score_one_below_threshold_is_unknown(self):
-        assert self.c._classify_parent(69, set()) == "UNKNOWN"
-
-    def test_high_score_with_malicious_cascade_label_is_unknown(self):
-        # Parent was itself cascade-inferred — propagating further would
-        # let a single hot child contaminate its entire sibling population.
-        assert self.c._classify_parent(80, {LABEL_MALICIOUS_CASCADE}) == "UNKNOWN"
-
-    def test_fp_candidate_low_score_is_unknown(self):
-        assert self.c._classify_parent(30, {LABEL_FP_CANDIDATE}) == "UNKNOWN"
-
-    def test_fp_confirmed_low_score_is_confirmed_benign(self):
-        assert self.c._classify_parent(30, {LABEL_FP_CONFIRMED}) == "CONFIRMED_BENIGN"
-
-    def test_vectra_metadata_benign_low_score_is_unknown(self):
-        assert self.c._classify_parent(30, {"vectra-metadata-benign"}) == "UNKNOWN"
-
-    def test_fp_candidate_but_high_score_is_confirmed_malicious(self):
-        # Malicious verdict takes priority over fp-candidate label
-        assert self.c._classify_parent(80, {LABEL_FP_CANDIDATE}) == "CONFIRMED_MALICIOUS"
-
-    def test_no_labels_neutral_score_is_unknown(self):
-        assert self.c._classify_parent(50, set()) == "UNKNOWN"
-
-    def test_zero_score_is_unknown(self):
-        assert self.c._classify_parent(0, set()) == "UNKNOWN"
-
-    @pytest.mark.parametrize("label", [LABEL_SINKHOLE, LABEL_SINKHOLED])
-    @pytest.mark.parametrize("score", [0, 30, 80])
-    def test_sinkhole_labels_are_confirmed_malicious_regardless_of_score(
-        self, label, score
-    ):
-        assert self.c._classify_parent(score, {label}) == "CONFIRMED_MALICIOUS"
-
-    @pytest.mark.parametrize("label", [LABEL_SINKHOLE, LABEL_SINKHOLED])
-    def test_sinkhole_labels_override_malicious_cascade(self, label):
-        assert self.c._classify_parent(
-            30, {label, LABEL_MALICIOUS_CASCADE}
-        ) == "CONFIRMED_MALICIOUS"
+class TestLegacyStateParsing:
+    @pytest.mark.parametrize("label", [LABEL_INHERITED_FP_CANDIDATE, LABEL_INHERITED_MALICIOUS_CASCADE])
+    def test_inherited_labels_are_not_structural_parent_hints(self, label):
+        assert IocTrustClusterConnector._parent_info_from_cluster_label("Domain-Name", label) is None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -959,7 +907,7 @@ class TestCidrLinking:
 
         obs_data = self.c.helper.api.stix_cyber_observable.create.call_args.kwargs["observableData"]
         assert obs_data["x_opencti_score"] == 0
-        assert self.c._classify_parent(obs_data["x_opencti_score"], set()) == "UNKNOWN"
+        self.c.helper.api.stix_cyber_observable.add_label.assert_not_called()
 
     def test_existing_cidr_parent_reused_not_duplicated(self):
         child  = _obs(value="10.20.30.40")
@@ -1168,265 +1116,34 @@ class TestCidrAsnOwnership:
 # Trust propagation (KEY: "trust propagate")
 # ══════════════════════════════════════════════════════════════════════════════
 
-class TestTrustPropagation:
-    """
-    Validates the three-state verdict cascade rules:
-      CONFIRMED_MALICIOUS → malicious-cascade DOWN to children
-      CONFIRMED_BENIGN    → fp-candidate DOWN to UNKNOWN children
-      UNKNOWN             → propagation stops (no cascade)
-    """
-
-    @pytest.fixture(autouse=True)
-    def con(self):
-        self.c = _make_connector()
-
-    # ── Malicious cascade ─────────────────────────────────────────────────────
-
-    def test_malicious_cidr_cascades_label_to_child(self):
-        child  = _obs(value="1.2.3.4",     score=50)
-        parent = _obs(entity_id="cidr-001", value="1.2.3.0/24", score=80)
-        _wire(self.c, child, parent)
-
-        result = self.c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
-
-        labels = _labels_created(self.c.helper)
-        assert LABEL_INHERITED_MALICIOUS_CASCADE in labels
-        assert "malicious-cascade" in result
-
-    def test_malicious_cidr_cascade_uses_red_color(self):
-        child  = _obs(value="1.2.3.4",     score=50)
-        parent = _obs(entity_id="cidr-001", value="1.2.3.0/24", score=80)
-        _wire(self.c, child, parent)
-
-        self.c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
-
-        malicious_calls = [
-            c for c in self.c.helper.api.label.create.call_args_list
-            if (c.kwargs.get("value") or "") == LABEL_INHERITED_MALICIOUS_CASCADE
-        ]
-        assert len(malicious_calls) >= 1
-        assert malicious_calls[0].kwargs["color"] == COLOR_MALICIOUS
-
-    def test_cascaded_parent_does_not_re_cascade(self):
-        """
-        A parent that carries 'malicious-cascade' was inferred, not directly
-        assessed — propagating further would contaminate siblings of siblings.
-        The parent verdict must be UNKNOWN → propagation stops.
-        """
-        child  = _obs(value="1.2.3.4",     score=50)
-        parent = _obs(entity_id="cidr-001", value="1.2.3.0/24",
-                      score=80, labels=[LABEL_MALICIOUS_CASCADE])
-        _wire(self.c, child, parent)
-
-        self.c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
-
-        labels = _labels_created(self.c.helper)
-        assert LABEL_MALICIOUS_CASCADE not in labels
-
-    def test_fp_candidate_conflict_creates_note_not_review_string(self):
-        """
-        #5: when fp-candidate and malicious-cascade coexist, a dedicated conflict
-        Note is created.  The prior inline REVIEW string is removed — the Note
-        is the only signal (visible in the feed view, not buried in the audit note).
-        """
+class TestNoParentPropagation:
+    @pytest.mark.parametrize("score,tags", [(85, []), (20, [LABEL_FP_CONFIRMED]),
+        (0, []), (85, [LABEL_MALICIOUS_CASCADE]), (0, [LABEL_SINKHOLED])])
+    @pytest.mark.parametrize("existing", [True, False])
+    def test_parent_assessment_does_not_change_child(self, score, tags, existing):
         c = _make_connector()
-        child = _obs(
-            value="1.2.3.4", score=30,
-            labels=[
-                f"{CLUSTER_LABEL_PREFIX}:1.2.3.0/24",  # already clustered
-                LABEL_FP_CANDIDATE,                      # set by prior ubiquity pass
-            ],
-        )
-        parent = _obs(entity_id="cidr-001", value="1.2.3.0/24", score=85)
+        child = _obs(score=0, labels=[LABEL_INHERITED_FP_CANDIDATE, LABEL_MALICIOUS_CASCADE])
+        parent = _obs(entity_id="cidr-001", value="1.2.3.0/24", score=score, labels=tags)
         _wire(c, child, parent)
+        if existing:
+            c.helper.api.stix_core_relationship.list.return_value = [_trust_rel(parent)]
+        c.process_message({"entity_id": child["id"], "entity_type": "IPv4-Addr"})
+        c.helper.api.stix_cyber_observable.add_label.assert_not_called()
+        c.helper.api.stix_cyber_observable.remove_label.assert_not_called()
+        c.helper.api.stix_cyber_observable.update_field.assert_not_called()
+        assert child["x_opencti_score"] == 0
+        assert not any("revocation" in str(n) or "conflict" in str(n)
+                       for n in c.helper.api.note.create.call_args_list)
+        assert all("toId" not in call.kwargs for call in c.helper.api.stix_core_relationship.list.call_args_list)
 
-        result = c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
-
-        # malicious-cascade must be added (malicious signal wins)
-        assert LABEL_INHERITED_MALICIOUS_CASCADE in _labels_created(c.helper)
-        # Dedicated conflict Note created
-        conflict_notes = [
-            call for call in c.helper.api.note.create.call_args_list
-            if "conflict" in (call.kwargs.get("abstract") or "").lower()
-        ]
-        assert len(conflict_notes) == 1
-        # REVIEW string removed from action result (replaced by Note)
-        assert "REVIEW" not in result
-
-    def test_child_already_malicious_cascade_not_duplicated(self):
-        child  = _obs(value="1.2.3.4",     score=50, labels=[LABEL_MALICIOUS_CASCADE])
-        parent = _obs(entity_id="cidr-001", value="1.2.3.0/24", score=80)
-        _wire(self.c, child, parent)
-
-        self.c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
-
-        malicious_label_calls = [
-            c for c in self.c.helper.api.label.create.call_args_list
-            if (c.kwargs.get("value") or "") == LABEL_INHERITED_MALICIOUS_CASCADE
-        ]
-        assert len(malicious_label_calls) == 0, "label already present — no duplicate"
-
-    # ── FP / benign cascade ───────────────────────────────────────────────────
-
-    def test_fp_candidate_cidr_propagates_to_unknown_child(self):
-        child  = _obs(value="1.2.3.4",     score=30)    # UNKNOWN, low score
-        parent = _obs(entity_id="cidr-001", value="1.2.3.0/24",
-                      score=30, labels=[LABEL_FP_CONFIRMED])
-        _wire(self.c, child, parent)
-
-        result = self.c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
-
-        labels = _labels_created(self.c.helper)
-        assert LABEL_INHERITED_FP_CANDIDATE in labels
-        assert "fp-candidate" in result
-
-    def test_fp_candidate_not_propagated_when_child_score_high(self):
-        child  = _obs(value="1.2.3.4",     score=60)    # above unknown_score_max=50
-        parent = _obs(entity_id="cidr-001", value="1.2.3.0/24",
-                      score=30, labels=[LABEL_FP_CONFIRMED])
-        _wire(self.c, child, parent)
-
-        self.c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
-
-        labels = _labels_created(self.c.helper)
-        assert LABEL_FP_CANDIDATE not in labels
-
-    def test_fp_candidate_not_propagated_when_child_has_malicious_context(self):
-        """Child with a malicious indicator must never be labelled fp-candidate."""
-        child = _obs(
-            value="1.2.3.4", score=30,
-            indicators=[{"x_opencti_score": 80}],   # malicious indicator
-        )
-        parent = _obs(entity_id="cidr-001", value="1.2.3.0/24",
-                      score=30, labels=[LABEL_FP_CONFIRMED])
-        _wire(self.c, child, parent)
-
-        self.c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
-
-        labels = _labels_created(self.c.helper)
-        assert LABEL_FP_CANDIDATE not in labels
-
-    def test_string_indicator_score_does_not_crash(self):
-        """
-        B8: non-integer x_opencti_score (e.g. \"high\" from OTX/MISP) must not
-        raise ValueError and must not block process_message from completing.
-        A non-parseable score is treated as 0 (not malicious).
-        """
-        child = _obs(
-            value="1.2.3.4", score=50,
-            indicators=[{"x_opencti_score": "critical"}],  # string from external feed
-        )
-        parent = _obs(entity_id="cidr-001", value="1.2.3.0/24",
-                      score=30, labels=[LABEL_FP_CONFIRMED])
-        _wire(self.c, child, parent)
-
-        # Must not raise; string score is treated as 0 — fp-candidate can cascade
-        result = self.c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
-        assert "skipped" not in result
-        # has_malicious=False (string treated as 0), so fp-candidate cascades
-        assert LABEL_INHERITED_FP_CANDIDATE in _labels_created(self.c.helper)
-
-    def test_score_zero_treated_as_zero_not_fifty(self):
-        """
-        B2: x_opencti_score=0 must read as 0, not 50 (the 'or 50' falsy gotcha).
-        A score-0 child is below fp_cascade_score_max (default 50) so it must
-        receive the fp-candidate cascade from a CONFIRMED_BENIGN parent.
-        """
-        c = _make_connector({"TRUST_CLUSTER_FP_CASCADE_SCORE_MAX": "49"})
-        # score=0: old code would treat as 50 (> fp_cascade_score_max=49) → no cascade
-        # fixed code: 0 <= 49 → cascade fires
-        child  = _obs(value="1.2.3.4", score=0)
-        parent = _obs(entity_id="cidr-001", value="1.2.3.0/24",
-                      score=30, labels=[LABEL_FP_CONFIRMED])
-        _wire(c, child, parent)
-
-        c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
-
-        assert LABEL_INHERITED_FP_CANDIDATE in _labels_created(c.helper), (
-            "score=0 must cascade fp-candidate; was being read as 50 (falsy gotcha)"
-        )
-
-    def test_unknown_parent_stops_propagation(self):
-        child  = _obs(value="1.2.3.4",     score=30)
-        parent = _obs(entity_id="cidr-001", value="1.2.3.0/24", score=50)  # UNKNOWN
-        _wire(self.c, child, parent)
-
-        self.c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
-
-        labels = _labels_created(self.c.helper)
-        assert LABEL_MALICIOUS_CASCADE not in labels
-        assert LABEL_FP_CANDIDATE      not in labels
-
-    def test_action_string_reports_cascade(self):
-        child  = _obs(value="1.2.3.4",     score=50)
-        parent = _obs(entity_id="cidr-001", value="1.2.3.0/24", score=80)
-        _wire(self.c, child, parent)
-
-        result = self.c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
-
-        assert "malicious-cascade" in result
-        assert "1.2.3.0/24" in result
-
-    def test_fp_cascade_score_max_configurable(self):
-        """
-        TRUST_CLUSTER_FP_CASCADE_SCORE_MAX lets operators extend the benign cascade
-        threshold above unknown_score_max without changing the ubiquity heuristic.
-
-        Default (50): child with score=60 is NOT cascaded (existing test coverage).
-        Raised to 65: the same child MUST receive fp-candidate from a benign parent.
-        """
-        c = _make_connector({"TRUST_CLUSTER_FP_CASCADE_SCORE_MAX": "65"})
-        # score=60 > unknown_score_max=50 but ≤ custom fp_cascade_score_max=65
-        child  = _obs(value="1.2.3.4",     score=60)
-        parent = _obs(entity_id="cidr-001", value="1.2.3.0/24",
-                      score=30, labels=[LABEL_FP_CONFIRMED])
-        _wire(c, child, parent)
-
-        c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
-
-        assert LABEL_INHERITED_FP_CANDIDATE in _labels_created(c.helper), (
-            "fp-candidate must cascade when child score (≤60 for fp) ≤ "
-            "fp_cascade_score_max=65, even though it exceeds unknown_score_max=50"
-        )
-
-    def test_fp_candidate_does_not_cascade_to_malicious_score_even_if_below_fp_cascade_max(self):
-        """
-        B16: fp-candidate must NOT cascade to a child whose score already meets
-        malicious_score_min, regardless of how fp_cascade_score_max is configured.
-
-        Scenario: FP_CASCADE_SCORE_MAX=80, MALICIOUS_SCORE_MIN=70.
-        Child score=75 is ≤ fp_cascade_score_max=80 but is also ≥ malicious_score_min=70.
-        The explicit `score < malicious_score_min` guard must block the cascade.
-        """
-        c = _make_connector({
-            "TRUST_CLUSTER_FP_CASCADE_SCORE_MAX": "80",
-            "TRUST_CLUSTER_MALICIOUS_SCORE_MIN":  "70",
-        })
-        child  = _obs(value="1.2.3.4", score=75)   # malicious-scored, no indicator
-        parent = _obs(entity_id="cidr-001", value="1.2.3.0/24",
-                      score=30, labels=[LABEL_FP_CONFIRMED])
-        _wire(c, child, parent)
-
-        c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
-
-        assert LABEL_FP_CANDIDATE not in _labels_created(c.helper), (
-            "fp-candidate must not cascade to score=75 when malicious_score_min=70"
-        )
-
-    def test_fp_candidate_cascades_just_below_malicious_threshold(self):
-        """B16: score one below malicious_score_min still receives cascade."""
-        c = _make_connector({
-            "TRUST_CLUSTER_FP_CASCADE_SCORE_MAX": "80",
-            "TRUST_CLUSTER_MALICIOUS_SCORE_MIN":  "70",
-        })
-        child  = _obs(value="1.2.3.4", score=69)   # one below threshold
-        parent = _obs(entity_id="cidr-001", value="1.2.3.0/24",
-                      score=30, labels=[LABEL_FP_CONFIRMED])
-        _wire(c, child, parent)
-
-        c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
-
-        assert LABEL_INHERITED_FP_CANDIDATE in _labels_created(c.helper)
+    @pytest.mark.parametrize("indicator_score", ["critical", 80])
+    def test_direct_ubiquity_still_handles_indicator_scores(self, indicator_score):
+        c = _make_connector({"TRUST_CLUSTER_UNKNOWN_SCORE_MAX": "49"})
+        child = _obs(entity_type="StixFile", score=0, indicators=[{"x_opencti_score": indicator_score}])
+        _wire(c, child)
+        c.helper.api.stix_sighting_relationship.list.return_value = [{}] * 10
+        c.process_message({"entity_id": child["id"], "entity_type": "StixFile"})
+        assert (LABEL_FP_CANDIDATE in _labels_created(c.helper)) == (indicator_score == "critical")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1463,7 +1180,7 @@ class TestDomainLinking:
 
         self.c.helper.api.stix_core_relationship.create.assert_not_called()
 
-    def test_malicious_root_domain_cascades_to_subdomain(self):
+    def test_malicious_root_domain_does_not_change_subdomain_tags(self):
         child  = _obs(entity_type="Domain-Name", value="cdn.evil.com",   score=50)
         parent = _obs(entity_id="dom-001",       entity_type="Domain-Name",
                       value="evil.com", score=85)
@@ -1471,7 +1188,7 @@ class TestDomainLinking:
 
         self.c.process_message({"entity_id": "obs-001", "entity_type": "Domain-Name"})
 
-        assert LABEL_INHERITED_MALICIOUS_CASCADE in _labels_created(self.c.helper)
+        self.c.helper.api.stix_cyber_observable.add_label.assert_not_called()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1932,8 +1649,8 @@ class TestExtractParentDomainNsLookup:
         c._get_authoritative_ns = MagicMock(return_value="ns1.cloudflare.co.uk")
         assert c._extract_parent("Domain-Name", "example.com") is None
 
-    def test_malicious_ns_cascades_to_root_domain(self):
-        """End-to-end: root domain linked to malicious NS → gets malicious-cascade."""
+    def test_malicious_ns_is_graph_context_only(self):
+        """NS discovery is retained without copying its assessment."""
         c = _make_connector({"TRUST_CLUSTER_USE_NS_LOOKUP": "true"})
         c._get_authoritative_ns = MagicMock(return_value='ns1.bulletproof.ru')
 
@@ -1944,10 +1661,10 @@ class TestExtractParentDomainNsLookup:
 
         c.process_message({"entity_id": "obs-001", "entity_type": "Domain-Name"})
 
-        assert LABEL_INHERITED_MALICIOUS_CASCADE in _labels_created(c.helper)
+        c.helper.api.stix_cyber_observable.add_label.assert_not_called()
 
-    def test_benign_ns_propagates_fp_candidate_to_root_domain(self):
-        """Root domain under a benign NS inherits fp-candidate."""
+    def test_benign_ns_is_graph_context_only(self):
+        """Root domain under a benign NS gets an edge, not fp-candidate."""
         c = _make_connector({"TRUST_CLUSTER_USE_NS_LOOKUP": "true"})
         c._get_authoritative_ns = MagicMock(return_value='ns1.goodprovider.com')
 
@@ -1959,7 +1676,7 @@ class TestExtractParentDomainNsLookup:
 
         c.process_message({"entity_id": "obs-001", "entity_type": "Domain-Name"})
 
-        assert LABEL_INHERITED_FP_CANDIDATE in _labels_created(c.helper)
+        c.helper.api.stix_cyber_observable.add_label.assert_not_called()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1967,241 +1684,34 @@ class TestExtractParentDomainNsLookup:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestAlreadyClustered:
-    """
-    Verify the short-circuit path: observables that already carry a
-    trust-cluster:* label skip DNS/RDAP re-discovery and structural
-    re-linking, but still re-check parent verdict on each trigger.
-    """
-
-    def test_skips_extract_parent_when_already_clustered(self):
-        """_extract_parent must not be called when cluster label already exists."""
-        c = _make_connector()
-        child = _obs(
-            value="1.2.3.4", score=50,
-            labels=[f"{CLUSTER_LABEL_PREFIX}:1.2.3.0/24"],
-        )
-        parent = _obs(entity_id="cidr-001", value="1.2.3.0/24", score=50)
-        _wire(c, child, parent)
-        c.helper.api.stix_core_relationship.list.return_value = [_trust_rel(parent)]
-        c._extract_parent = MagicMock(wraps=c._extract_parent)
-
-        c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
-
-        c._extract_parent.assert_not_called()
-
-    def test_skips_relationship_and_label_when_already_clustered(self):
-        """Already-clustered observable must not re-create relationship or labels."""
-        c = _make_connector()
-        cluster_lbl = f"{CLUSTER_LABEL_PREFIX}:1.2.3.0/24"
-        child = _obs(value="1.2.3.4", score=50, labels=[cluster_lbl])
-        parent = _obs(entity_id="cidr-001", value="1.2.3.0/24", score=50)
-        _wire(c, child, parent)
-        c.helper.api.stix_core_relationship.list.return_value = [_trust_rel(parent)]
-
-        c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
-
-        c.helper.api.stix_core_relationship.create.assert_not_called()
-        # Cluster label must not be re-added (already present)
-        added = _labels_created(c.helper)
-        assert cluster_lbl not in added
-
-    def test_still_cascades_malicious_when_parent_later_scored_high(self):
-        """
-        Already-clustered child with UNKNOWN parent that later becomes
-        CONFIRMED_MALICIOUS must receive malicious-cascade on next trigger.
-        """
-        c = _make_connector()
-        child = _obs(
-            value="1.2.3.4", score=50,
-            labels=[f"{CLUSTER_LABEL_PREFIX}:1.2.3.0/24"],  # previously clustered
-        )
-        # Parent is now malicious (score changed since first processing)
-        parent = _obs(entity_id="cidr-001", value="1.2.3.0/24", score=85)
-        _wire(c, child, parent)
-        c.helper.api.stix_core_relationship.list.return_value = [_trust_rel(parent)]
-
-        c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
-
-        assert LABEL_INHERITED_MALICIOUS_CASCADE in _labels_created(c.helper)
-
-    def test_no_revocation_when_parent_still_malicious(self):
-        """
-        #4: parent still CONFIRMED_MALICIOUS — no revocation note, no label changes.
-        The revocation check runs (parent is looked up), but finding it still
-        malicious means nothing is surfaced to the analyst.
-        """
-        c = _make_connector()
-        child = _obs(
-            value="1.2.3.4", score=50,
-            labels=[
-                f"{CLUSTER_LABEL_PREFIX}:1.2.3.0/24",
-                LABEL_MALICIOUS_CASCADE,
-            ],
-        )
-        # Parent remains CONFIRMED_MALICIOUS
-        parent = _obs(entity_id="cidr-001", value="1.2.3.0/24", score=85)
-        _wire(c, child, parent)
-        c.helper.api.stix_core_relationship.list.return_value = [_trust_rel(parent)]
-
-        c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
-
-        # No revocation note (parent still malicious)
-        revocation_notes = [
-            call for call in c.helper.api.note.create.call_args_list
-            if "revocation" in (call.kwargs.get("abstract") or "").lower()
-        ]
-        assert len(revocation_notes) == 0
-        # No label changes
-        assert not _labels_created(c.helper)
-
-    def test_orphaned_child_logs_warning(self):
-        """
-        B7: already-clustered child whose parent no longer exists must log
-        a WARNING so the silent cascade blackhole is visible in production logs.
-        """
-        c = _make_connector()
-        child = _obs(
-            value="1.2.3.4", score=50,
-            labels=[f"{CLUSTER_LABEL_PREFIX}:1.2.3.0/24"],
-        )
-        c.helper.api.stix_cyber_observable.read.return_value = child
-        # Parent lookup returns nothing — parent was deleted
-        c.helper.api.stix_cyber_observable.list.return_value = []
-
-        c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
-
-        assert c.helper.log_warning.called
-        warning_text = str(c.helper.log_warning.call_args)
-        assert "stale cluster label" in warning_text or "not found" in warning_text
-
-    def test_x509_already_clustered_uses_x509_type_not_domain_name(self):
-        """
-        Regression for: already-clustered X509 child looked up parent as
-        Domain-Name (wrong type), silently missed cascade updates after
-        first run.
-
-        The already-clustered label inference must resolve X509-Certificate
-        children to X509-Certificate parents, not fall through to Domain-Name.
-        An issuer DN ('CN=Root CA,O=Corp') contains no '/' and no label-only
-        prefix, so without the explicit X509 branch it became 'Domain-Name'.
-        """
-        c = _make_connector()
-        cluster_lbl = f"{CLUSTER_LABEL_PREFIX}:CN=Root CA,O=Corp"
-        child = _obs(
-            entity_type="X509-Certificate", value="CN=leaf.corp.com",
-            score=50, labels=[cluster_lbl],
-            issuer="CN=Root CA,O=Corp", subject="CN=leaf.corp.com",
-        )
-        # Parent CA is now malicious (score changed since first run)
-        ca_parent = _obs(
-            entity_id="ca-001", entity_type="X509-Certificate",
-            value="CN=Root CA,O=Corp", score=85,
-            subject="CN=Root CA,O=Corp",
-        )
-        # Simulate production: list() only returns results when types=['X509-Certificate']
-        def _typed_list(*args, **kwargs):
-            types_arg = kwargs.get("types") or []
-            return [ca_parent] if "X509-Certificate" in types_arg else []
-        c.helper.api.stix_cyber_observable.list.side_effect = _typed_list
-        c.helper.api.stix_cyber_observable.read.return_value = child
-        c.helper.api.stix_core_relationship.list.return_value = [_trust_rel(ca_parent)]
-
-        result = c.process_message({"entity_id": "obs-001", "entity_type": "X509-Certificate"})
-
-        assert LABEL_INHERITED_MALICIOUS_CASCADE in _labels_created(c.helper), (
-            "malicious CA must cascade to already-clustered child cert "
-            "(previously silently skipped due to wrong parent type lookup)"
-        )
-        assert "malicious-cascade" in result
-
-    def test_already_clustered_domain_uses_label_not_ns_lookup(self):
-        """Domain with existing cluster label must skip NS DNS lookup."""
+    @pytest.mark.parametrize("kind,value,parent_value", [
+        ("IPv4-Addr", "1.2.3.4", "1.2.3.0/24"),
+        ("Domain-Name", "evil.com", "ns1.example.com"),
+        ("X509-Certificate", "CN=leaf.corp.com", "CN=Root CA,O=Corp"),
+    ])
+    def test_existing_edges_skip_discovery_and_all_assessment_writes(self, kind, value, parent_value):
         c = _make_connector({"TRUST_CLUSTER_USE_NS_LOOKUP": "true"})
-        c._get_authoritative_ns = MagicMock()
-        child = _obs(
-            entity_type="Domain-Name", value="evil.com", score=50,
-            labels=[f"{CLUSTER_LABEL_PREFIX}:ns1.bulletproof.ru"],
-        )
-        parent = _obs(entity_id="ns-001", entity_type="Domain-Name",
-                      value="ns1.bulletproof.ru", score=50)
+        child = _obs(entity_type=kind, value=value,
+                     labels=[LABEL_MALICIOUS_CASCADE, LABEL_FP_CANDIDATE])
+        parent = _obs(entity_id="parent", entity_type=kind, value=parent_value, score=85, subject=parent_value)
         _wire(c, child, parent)
         c.helper.api.stix_core_relationship.list.return_value = [_trust_rel(parent)]
+        c._extract_parent = MagicMock(side_effect=AssertionError("must reuse edge"))
+        for score in [85, 0, 20]:
+            parent["x_opencti_score"] = score
+            assert c.process_message({"entity_id": child["id"], "entity_type": kind}) == "no actions"
+        c.helper.api.stix_core_relationship.create.assert_not_called()
+        c.helper.api.stix_cyber_observable.add_label.assert_not_called()
+        c.helper.api.stix_cyber_observable.remove_label.assert_not_called()
+        c.helper.api.note.create.assert_not_called()
 
-        c.process_message({"entity_id": "obs-001", "entity_type": "Domain-Name"})
-
-        c._get_authoritative_ns.assert_not_called()
-
-    def test_revocation_note_created_when_parent_no_longer_malicious(self):
-        """
-        #4: child carries malicious-cascade; parent score later reset to UNKNOWN.
-        Revocation advisory Note must be created on the next enrichment cycle.
-        """
+    def test_orphaned_legacy_label_warns(self):
         c = _make_connector()
-        child = _obs(
-            value="1.2.3.4", score=50,
-            labels=[
-                f"{CLUSTER_LABEL_PREFIX}:1.2.3.0/24",
-                LABEL_MALICIOUS_CASCADE,   # was cascaded on a prior cycle
-            ],
-        )
-        # Parent score has since been reset to UNKNOWN (50)
-        parent = _obs(entity_id="cidr-001", value="1.2.3.0/24", score=50)
-        _wire(c, child, parent)
-        c.helper.api.stix_core_relationship.list.return_value = [_trust_rel(parent)]
-
-        c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
-
-        revocation_notes = [
-            call for call in c.helper.api.note.create.call_args_list
-            if "cascade revocation —" in (call.kwargs.get("abstract") or "")
-        ]
-        assert len(revocation_notes) == 1
-        assert "obs-001" in revocation_notes[0].kwargs.get("objectRefs", [])
-
-    def test_revocation_note_not_duplicated_across_triggers(self):
-        """#4: revocation note created once per session, not on every trigger."""
-        c = _make_connector()
-        child = _obs(
-            value="1.2.3.4", score=50,
-            labels=[
-                f"{CLUSTER_LABEL_PREFIX}:1.2.3.0/24",
-                LABEL_MALICIOUS_CASCADE,
-            ],
-        )
-        parent = _obs(entity_id="cidr-001", value="1.2.3.0/24", score=50)  # UNKNOWN
-        _wire(c, child, parent)
-        c.helper.api.stix_core_relationship.list.return_value = [_trust_rel(parent)]
-
-        c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
-        c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
-
-        revocation_notes = [
-            call for call in c.helper.api.note.create.call_args_list
-            if "cascade revocation —" in (call.kwargs.get("abstract") or "")
-        ]
-        assert len(revocation_notes) == 1   # deduplicated by session set
-
-    def test_conflict_note_not_duplicated_across_triggers(self):
-        """#5: conflict note created once per session when both labels coexist."""
-        c = _make_connector()
-        child = _obs(
-            value="1.2.3.4", score=30,
-            labels=[
-                f"{CLUSTER_LABEL_PREFIX}:1.2.3.0/24",
-                LABEL_FP_CANDIDATE,
-            ],
-        )
-        parent = _obs(entity_id="cidr-001", value="1.2.3.0/24", score=85)
-        _wire(c, child, parent)
-
-        c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
-        c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
-
-        conflict_notes = [
-            call for call in c.helper.api.note.create.call_args_list
-            if "conflict" in (call.kwargs.get("abstract") or "").lower()
-        ]
-        assert len(conflict_notes) == 1   # deduplicated by session set
+        child = _obs(labels=[f"{CLUSTER_LABEL_PREFIX}:1.2.3.0/24"])
+        c.helper.api.stix_cyber_observable.read.return_value = child
+        c.helper.api.stix_cyber_observable.list.return_value = []
+        c.process_message({"entity_id": child["id"], "entity_type": "IPv4-Addr"})
+        assert "stale cluster label" in str(c.helper.log_warning.call_args)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2220,7 +1730,7 @@ class TestRelationshipSourceOfTruth:
             _obs(entity_id="benign", entity_type="Domain-Name", value="good.example", score=20, labels=[LABEL_FP_CONFIRMED]),
         ],
     ])
-    def test_multi_parent_malicious_wins_order_independent(self, parents):
+    def test_mixed_parents_do_not_change_child_order_independent(self, parents):
         c = _make_connector()
         child = _obs(entity_type="Domain-Name", value="host.example", score=30)
         c.helper.api.stix_cyber_observable.read.return_value = child
@@ -2228,10 +1738,8 @@ class TestRelationshipSourceOfTruth:
 
         result = c.process_message({"entity_id": "obs-001", "entity_type": "Domain-Name"})
 
-        labels = _labels_created(c.helper)
-        assert LABEL_INHERITED_MALICIOUS_CASCADE in labels
-        assert LABEL_FP_CANDIDATE not in labels
-        assert "malicious-cascade" in result
+        assert _labels_created(c.helper) == []
+        assert result == "no actions"
 
     @pytest.mark.parametrize("parents", [
         [
@@ -2243,7 +1751,7 @@ class TestRelationshipSourceOfTruth:
             _obs(entity_id="unknown", entity_type="Domain-Name", value="maybe.example", score=50),
         ],
     ])
-    def test_multi_parent_unknown_blocks_benign_order_independent(self, parents):
+    def test_multi_parent_unknown_and_benign_are_context_only(self, parents):
         c = _make_connector()
         child = _obs(entity_type="Domain-Name", value="host.example", score=30)
         c.helper.api.stix_cyber_observable.read.return_value = child
@@ -2256,7 +1764,7 @@ class TestRelationshipSourceOfTruth:
         assert LABEL_FP_CANDIDATE not in labels
         assert "inherited" not in result
 
-    def test_multi_parent_all_benign_inherits_fp_candidate(self):
+    def test_multi_parent_all_benign_does_not_inherit(self):
         c = _make_connector()
         child = _obs(entity_type="Domain-Name", value="host.example", score=30)
         parents = [
@@ -2268,8 +1776,8 @@ class TestRelationshipSourceOfTruth:
 
         result = c.process_message({"entity_id": "obs-001", "entity_type": "Domain-Name"})
 
-        assert LABEL_INHERITED_FP_CANDIDATE in _labels_created(c.helper)
-        assert "fp-candidate inherited" in result
+        assert _labels_created(c.helper) == []
+        assert result == "no actions"
 
     def test_relationship_parent_lookup_requests_all_pages(self):
         c = _make_connector()
@@ -2284,7 +1792,7 @@ class TestRelationshipSourceOfTruth:
             fromId="obs-001", relationship_type="related-to", getAll=True
         )
 
-    def test_related_to_edge_drives_inheritance(self):
+    def test_related_to_edge_reused_without_inheritance(self):
         c = _make_connector()
         child = _obs(value="1.2.3.4", score=50, labels=[])
         parent = _obs(entity_id="cidr-001", value="1.2.3.0/24", score=85)
@@ -2295,8 +1803,8 @@ class TestRelationshipSourceOfTruth:
 
         result = c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
 
-        assert LABEL_INHERITED_MALICIOUS_CASCADE in _labels_created(c.helper)
-        assert "malicious-cascade from IPv4-Addr:1.2.3.0/24" in result
+        assert _labels_created(c.helper) == []
+        assert result == "no actions"
         c.helper.api.stix_core_relationship.create.assert_not_called()
 
     def test_relationship_lookup_failure_preserves_inherited_state(self):
@@ -2315,10 +1823,7 @@ class TestRelationshipSourceOfTruth:
     def test_relationship_parent_read_failure_preserves_inherited_state(self):
         c = _make_connector()
         child = _obs(labels=[LABEL_INHERITED_MALICIOUS_CASCADE])
-        partial_parent = {
-            "id": "cidr-001", "entity_type": "IPv4-Addr",
-            "observable_value": "1.2.3.0/24",
-        }
+        partial_parent = {"id": "cidr-001"}
         c.helper.api.stix_cyber_observable.read.side_effect = [
             child, RuntimeError("unavailable"),
         ]
@@ -2355,7 +1860,18 @@ class TestRelationshipSourceOfTruth:
         c.helper.api.stix_cyber_observable.remove_label.assert_not_called()
         c.helper.api.note.create.assert_not_called()
 
-    def test_existing_relationship_reads_parent_when_edge_payload_is_partial(self):
+    def test_missing_parent_identity_is_hydrated_without_assessment_writes(self):
+        c = _make_connector()
+        child = _obs()
+        parent = _obs(entity_id="parent", value="1.2.3.0/24", score=85)
+        c.helper.api.stix_cyber_observable.read.side_effect = [child, parent]
+        c.helper.api.stix_core_relationship.list.return_value = [_trust_rel({"id": "parent"})]
+        assert c.process_message({"entity_id": child["id"], "entity_type": "IPv4-Addr"}) == "no actions"
+        c.helper.api.stix_cyber_observable.read.assert_any_call(id="parent")
+        c.helper.api.stix_cyber_observable.add_label.assert_not_called()
+        c.helper.api.stix_core_relationship.create.assert_not_called()
+
+    def test_existing_relationship_needs_no_parent_score_or_label_read(self):
         c = _make_connector()
         child = _obs(value="1.2.3.4", score=50, labels=[])
         partial_parent = {
@@ -2371,9 +1887,9 @@ class TestRelationshipSourceOfTruth:
 
         result = c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
 
-        c.helper.api.stix_cyber_observable.read.assert_any_call(id="cidr-001")
-        assert LABEL_INHERITED_MALICIOUS_CASCADE in _labels_created(c.helper)
-        assert "malicious-cascade from IPv4-Addr:1.2.3.0/24" in result
+        c.helper.api.stix_cyber_observable.read.assert_called_once_with(id="obs-001")
+        assert _labels_created(c.helper) == []
+        assert result == "no actions"
 
     def test_existing_relationship_missing_label_no_duplicate_rel(self):
         c = _make_connector()
@@ -2387,7 +1903,7 @@ class TestRelationshipSourceOfTruth:
         c.helper.api.stix_core_relationship.create.assert_not_called()
         labels = _labels_created(c.helper)
         assert f"{CLUSTER_LABEL_PREFIX}:1.2.3.0/24" not in labels
-        assert LABEL_INHERITED_MALICIOUS_CASCADE in labels
+        assert labels == []
         assert "repaired cluster label" not in result
 
     def test_existing_relationship_skips_parent_extraction(self):
@@ -2461,389 +1977,57 @@ class TestRelationshipSourceOfTruth:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Connector-owned inherited state retraction (580)
+# Legacy inherited state preservation
 # ══════════════════════════════════════════════════════════════════════════════
 
-class TestInheritedStateRetraction:
-
-    def test_unknown_parent_removes_only_namespaced_malicious_state(self):
+class TestLegacyStatePreservation:
+    @pytest.mark.parametrize("score", [0, 20, 85])
+    @pytest.mark.parametrize("with_parent", [False, True])
+    def test_stored_tags_and_score_are_never_reconciled(self, score, with_parent):
         c = _make_connector()
-        child = _obs(
-            value="1.2.3.4", score=50,
-            labels=[LABEL_INHERITED_MALICIOUS_CASCADE, LABEL_MALICIOUS_CASCADE],
-        )
-        parent = _obs(entity_id="cidr-001", value="1.2.3.0/24", score=50)
+        tags = [LABEL_INHERITED_FP_CANDIDATE, LABEL_INHERITED_MALICIOUS_CASCADE,
+                LABEL_FP_CANDIDATE, LABEL_FP_CONFIRMED, LABEL_MALICIOUS_CASCADE,
+                LABEL_SINKHOLED, "analyst-tag"]
+        child = _obs(entity_type="Domain-Name", value="example.com", score=score, labels=tags)
+        parent = _obs(entity_id="parent", entity_type="Domain-Name", value="ns.example.net", score=score)
         c.helper.api.stix_cyber_observable.read.return_value = child
-        c.helper.api.stix_core_relationship.list.return_value = [_trust_rel(parent)]
-
-        result = c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
-
-        c.helper.api.stix_cyber_observable.remove_label.assert_called_once_with(
-            id="obs-001", label_id="label-0"
-        )
-        assert "removed unsupported inherited malicious state" in result
-
-    def test_unknown_parent_removes_only_namespaced_fp_state(self):
-        c = _make_connector()
-        child = _obs(
-            entity_type="Domain-Name", value="host.example", score=30,
-            labels=[LABEL_INHERITED_FP_CANDIDATE, LABEL_FP_CANDIDATE],
-        )
-        parent = _obs(entity_id="parent", entity_type="Domain-Name", value="example", score=50)
-        c.helper.api.stix_cyber_observable.read.return_value = child
-        c.helper.api.stix_core_relationship.list.return_value = [_trust_rel(parent)]
-
-        result = c.process_message({"entity_id": "obs-001", "entity_type": "Domain-Name"})
-
-        c.helper.api.stix_cyber_observable.remove_label.assert_called_once_with(
-            id="obs-001", label_id="label-0"
-        )
-        assert "removed unsupported inherited fp state" in result
-
-    def test_mixed_parent_removes_fp_and_adds_malicious_state(self):
-        c = _make_connector()
-        child = _obs(
-            entity_type="Domain-Name", value="host.example", score=30,
-            labels=[LABEL_INHERITED_FP_CANDIDATE],
-        )
-        parents = [
-            _obs(entity_id="good", entity_type="Domain-Name", value="good.example", score=20, labels=[LABEL_FP_CONFIRMED]),
-            _obs(entity_id="bad", entity_type="Domain-Name", value="bad.example", score=85),
-        ]
-        c.helper.api.stix_cyber_observable.read.return_value = child
-        c.helper.api.stix_core_relationship.list.return_value = [_trust_rel(p) for p in parents]
-
-        result = c.process_message({"entity_id": "obs-001", "entity_type": "Domain-Name"})
-
-        assert LABEL_INHERITED_MALICIOUS_CASCADE in _labels_created(c.helper)
-        c.helper.api.stix_cyber_observable.remove_label.assert_called_once_with(
-            id="obs-001", label_id="label-0"
-        )
-        assert "removed unsupported inherited fp state" in result
-
-    def test_benign_parent_keeps_supported_inherited_fp_state(self):
-        c = _make_connector()
-        child = _obs(
-            entity_type="Domain-Name", value="host.example", score=30,
-            labels=[LABEL_INHERITED_FP_CANDIDATE],
-        )
-        parent = _obs(entity_id="good", entity_type="Domain-Name", value="good.example", score=20, labels=[LABEL_FP_CONFIRMED])
-        c.helper.api.stix_cyber_observable.read.return_value = child
-        c.helper.api.stix_core_relationship.list.return_value = [_trust_rel(parent)]
-
-        c.process_message({"entity_id": "obs-001", "entity_type": "Domain-Name"})
-
+        if with_parent:
+            c.helper.api.stix_core_relationship.list.return_value = [_trust_rel(parent)]
+        assert c.process_message({"entity_id": child["id"], "entity_type": "Domain-Name"}) == "no actions"
+        c.helper.api.stix_cyber_observable.add_label.assert_not_called()
         c.helper.api.stix_cyber_observable.remove_label.assert_not_called()
-
-    def test_remove_label_failure_logs_warning_and_leaves_prior_state(self):
-        c = _make_connector()
-        child = _obs(value="1.2.3.4", score=50, labels=[LABEL_INHERITED_MALICIOUS_CASCADE])
-        parent = _obs(entity_id="cidr-001", value="1.2.3.0/24", score=50)
-        c.helper.api.stix_cyber_observable.read.return_value = child
-        c.helper.api.stix_core_relationship.list.return_value = [_trust_rel(parent)]
-        c.helper.api.stix_cyber_observable.remove_label.side_effect = RuntimeError("boom")
-
-        result = c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
-
-        assert "removed unsupported" not in result
-        assert c.helper.log_warning.called
+        c.helper.api.note.create.assert_not_called()
+        assert c._entity_label_values(child) == set(tags)
+        assert child["x_opencti_score"] == score
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Parent-triggered fanout (TC2)
 # ══════════════════════════════════════════════════════════════════════════════
 
-class TestParentFanout:
-
-    @staticmethod
-    def _rels_for(parent_id: str, *rels):
-        def _list(*args, **kwargs):
-            if kwargs.get("toId") == parent_id:
-                return list(rels)
+class TestNoParentFanout:
+    @pytest.mark.parametrize("score,tags", [(85, []), (20, [LABEL_FP_CONFIRMED]), (0, [])])
+    def test_parent_trigger_never_enumerates_or_mutates_descendants(self, score, tags):
+        c = _make_connector()
+        parent = _obs(entity_id="cidr-001", value="1.2.3.0/24", score=score, labels=tags)
+        c.helper.api.stix_cyber_observable.read.return_value = parent
+        def list_relationships(**kwargs):
+            assert "toId" not in kwargs, "must not enumerate children"
             return []
-        return _list
+        c.helper.api.stix_core_relationship.list.side_effect = list_relationships
+        assert c.process_message({"entity_id": parent["id"], "entity_type": "IPv4-Addr"}) == "no actions"
+        c.helper.api.stix_cyber_observable.add_label.assert_not_called()
+        c.helper.api.stix_cyber_observable.remove_label.assert_not_called()
+        c.helper.api.note.create.assert_not_called()
 
-    @staticmethod
-    def _rels_with_parents(trigger_id: str, child: dict, *parents: dict):
-        def _list(*args, **kwargs):
-            if kwargs.get("toId") == trigger_id:
-                return [_child_rel(child)]
-            if kwargs.get("fromId") == child["id"]:
-                return [_trust_rel(parent) for parent in parents]
-            return []
-        return _list
-
-    def test_parent_malicious_fanout_labels_direct_child(self):
-        c = _make_connector()
-        parent = _obs(entity_id="cidr-001", value="1.2.3.0/24", score=85)
-        child = _obs(entity_id="child-1", value="1.2.3.4", score=50)
+    def test_direct_sinkhole_tag_is_not_fanned_out(self):
+        c = _make_connector({"TRUST_CLUSTER_SINKHOLE_IPS": "198.51.100.1"})
+        parent = _obs(entity_id="parent", entity_type="Domain-Name", value="example.com")
         c.helper.api.stix_cyber_observable.read.return_value = parent
-        c.helper.api.stix_core_relationship.list.side_effect = self._rels_for(
-            "cidr-001", _child_rel(child)
-        )
-
-        result = c.process_message({"entity_id": "cidr-001", "entity_type": "IPv4-Addr"})
-
-        assert LABEL_INHERITED_MALICIOUS_CASCADE in _labels_created(c.helper)
-        c.helper.api.stix_cyber_observable.add_label.assert_called_with(
-            id="child-1", label_id="label-id-stub"
-        )
-        assert "malicious-cascade" in result
-
-    def test_parent_benign_fanout_labels_eligible_child(self):
-        c = _make_connector()
-        parent = _obs(
-            entity_id="cidr-001", value="1.2.3.0/24", score=20,
-            labels=[LABEL_FP_CONFIRMED],
-        )
-        child = _obs(entity_id="child-1", value="1.2.3.4", score=50)
-        c.helper.api.stix_cyber_observable.read.return_value = parent
-        c.helper.api.stix_core_relationship.list.side_effect = self._rels_for(
-            "cidr-001", _child_rel(child)
-        )
-
-        result = c.process_message({"entity_id": "cidr-001", "entity_type": "IPv4-Addr"})
-
-        assert LABEL_INHERITED_FP_CANDIDATE in _labels_created(c.helper)
-        assert "fp-candidate inherited" in result
-
-    def test_parent_fanout_uses_direct_state_added_during_same_event(self):
-        sinkhole_ip = "198.51.100.1"
-        c = _make_connector({"TRUST_CLUSTER_SINKHOLE_IPS": sinkhole_ip})
-        parent = _obs(
-            entity_id="parent", entity_type="Domain-Name",
-            value="example.com", score=50,
-        )
-        child = _obs(
-            entity_id="child-1", entity_type="Domain-Name",
-            value="host.example.com", score=50,
-        )
-        c._get_resolved_ips = MagicMock(return_value=[sinkhole_ip])
-        c.helper.api.stix_cyber_observable.read.return_value = parent
-        c.helper.api.stix_core_relationship.list.side_effect = self._rels_with_parents(
-            "parent", child, parent
-        )
-
-        c.process_message({"entity_id": "parent", "entity_type": "Domain-Name"})
-
-        labels = _labels_created(c.helper)
-        assert LABEL_SINKHOLED in labels
-        assert LABEL_INHERITED_MALICIOUS_CASCADE in labels
-
-    @pytest.mark.parametrize("trigger_id", ["benign", "unknown"])
-    def test_parent_fanout_unknown_blocks_benign_across_event_order(self, trigger_id):
-        c = _make_connector()
-        parents = {
-            "benign": _obs(
-                entity_id="benign", entity_type="Domain-Name", value="good.com",
-                score=20, labels=[LABEL_FP_CONFIRMED],
-            ),
-            "unknown": _obs(
-                entity_id="unknown", entity_type="Domain-Name",
-                value="maybe.com", score=50,
-            ),
-        }
-        child = _obs(
-            entity_id="child-1", entity_type="Domain-Name",
-            value="host.example.com", score=30,
-        )
-        c.helper.api.stix_cyber_observable.read.return_value = parents[trigger_id]
-        c.helper.api.stix_core_relationship.list.side_effect = self._rels_with_parents(
-            trigger_id, child, *parents.values()
-        )
-
-        result = c.process_message({
-            "entity_id": trigger_id, "entity_type": "Domain-Name",
-        })
-
-        assert LABEL_INHERITED_FP_CANDIDATE not in _labels_created(c.helper)
-        assert "inherited" not in result
-
-    @pytest.mark.parametrize("trigger_id", ["benign", "malicious"])
-    def test_parent_fanout_malicious_wins_across_event_order(self, trigger_id):
-        c = _make_connector()
-        parents = {
-            "benign": _obs(
-                entity_id="benign", entity_type="Domain-Name", value="good.com",
-                score=20, labels=[LABEL_FP_CONFIRMED],
-            ),
-            "malicious": _obs(
-                entity_id="malicious", entity_type="Domain-Name",
-                value="evil.com", score=85,
-            ),
-        }
-        child = _obs(
-            entity_id="child-1", entity_type="Domain-Name",
-            value="host.example.com", score=30,
-        )
-        c.helper.api.stix_cyber_observable.read.return_value = parents[trigger_id]
-        c.helper.api.stix_core_relationship.list.side_effect = self._rels_with_parents(
-            trigger_id, child, *parents.values()
-        )
-
-        c.process_message({"entity_id": trigger_id, "entity_type": "Domain-Name"})
-
-        labels = _labels_created(c.helper)
-        assert LABEL_INHERITED_MALICIOUS_CASCADE in labels
-        assert LABEL_INHERITED_FP_CANDIDATE not in labels
-
-    def test_parent_unknown_fanout_retracts_owned_malicious_state(self):
-        c = _make_connector()
-        parent = _obs(
-            entity_id="parent", entity_type="Domain-Name",
-            value="example.com", score=50,
-        )
-        child = _obs(
-            entity_id="child-1", entity_type="Domain-Name",
-            value="host.example.com", score=50,
-            labels=[LABEL_INHERITED_MALICIOUS_CASCADE],
-        )
-        c.helper.api.stix_cyber_observable.read.return_value = parent
-        c.helper.api.stix_core_relationship.list.side_effect = self._rels_with_parents(
-            "parent", child, parent
-        )
-
-        result = c.process_message({"entity_id": "parent", "entity_type": "Domain-Name"})
-
-        c.helper.api.stix_cyber_observable.remove_label.assert_called_once_with(
-            id="child-1", label_id="label-0"
-        )
-        assert "inherited-state-retracted=1" in result
-
-    def test_parent_unknown_fanout_creates_revocation_note_for_cascaded_child(self):
-        c = _make_connector()
-        parent = _obs(entity_id="cidr-001", value="1.2.3.0/24", score=50)
-        child = _obs(
-            entity_id="child-1", value="1.2.3.4", score=50,
-            labels=[LABEL_MALICIOUS_CASCADE],
-        )
-        c.helper.api.stix_cyber_observable.read.return_value = parent
-        c.helper.api.stix_core_relationship.list.side_effect = self._rels_for(
-            "cidr-001", _child_rel(child)
-        )
-
-        result = c.process_message({"entity_id": "cidr-001", "entity_type": "IPv4-Addr"})
-
-        revocation_notes = [
-            call for call in c.helper.api.note.create.call_args_list
-            if "cascade revocation" in (call.kwargs.get("abstract") or "")
-        ]
-        assert len(revocation_notes) == 1
-        assert "cascade-revocation" in result
-
-    def test_parent_fanout_second_run_is_noop_when_label_already_present(self):
-        c = _make_connector()
-        parent = _obs(entity_id="cidr-001", value="1.2.3.0/24", score=85)
-        child = _obs(
-            entity_id="child-1", value="1.2.3.4", score=50,
-            labels=[LABEL_MALICIOUS_CASCADE],
-        )
-        c.helper.api.stix_cyber_observable.read.return_value = parent
-        c.helper.api.stix_core_relationship.list.side_effect = self._rels_for(
-            "cidr-001", _child_rel(child)
-        )
-
-        result = c.process_message({"entity_id": "cidr-001", "entity_type": "IPv4-Addr"})
-
-        assert LABEL_MALICIOUS_CASCADE not in _labels_created(c.helper)
-        assert "no actions" in result
-
-    def test_parent_fanout_requests_all_pages_and_uses_late_child(self):
-        c = _make_connector()
-        parent = _obs(entity_id="cidr-001", value="1.2.3.0/24", score=85)
-        child = _obs(entity_id="child-late", value="1.2.3.200", score=50)
-        c.helper.api.stix_cyber_observable.read.return_value = parent
-        c.helper.api.stix_core_relationship.list.side_effect = self._rels_for(
-            "cidr-001",
-            *[{"description": "manual analyst link", "from": _obs(entity_id=f"m{i}")} for i in range(100)],
-            _child_rel(child),
-        )
-
-        c.process_message({"entity_id": "cidr-001", "entity_type": "IPv4-Addr"})
-
-        c.helper.api.stix_core_relationship.list.assert_any_call(
-            toId="cidr-001", relationship_type="related-to", getAll=True
-        )
-        assert LABEL_INHERITED_MALICIOUS_CASCADE in _labels_created(c.helper)
-        c.helper.api.stix_cyber_observable.add_label.assert_called_with(
-            id="child-late", label_id="label-id-stub"
-        )
-
-    def test_parent_fanout_ignores_non_connector_relationships(self):
-        c = _make_connector()
-        parent = _obs(entity_id="cidr-001", value="1.2.3.0/24", score=85)
-        child = _obs(entity_id="child-1", value="1.2.3.4", score=50)
-        c.helper.api.stix_cyber_observable.read.return_value = parent
-        c.helper.api.stix_core_relationship.list.side_effect = self._rels_for(
-            "cidr-001", {"description": "manual analyst link", "from": child}
-        )
-
-        result = c.process_message({"entity_id": "cidr-001", "entity_type": "IPv4-Addr"})
-
-        assert LABEL_MALICIOUS_CASCADE not in _labels_created(c.helper)
-        assert "no actions" in result
-
-    def test_high_fanout_has_bounded_output_and_child_attributed_notes(self, monkeypatch):
-        import connector as _mod
-
-        child_count = 50
-        monkeypatch.setattr(_mod, "_CACHE_MAXSIZE", 10)
-        c = _make_connector({"TRUST_CLUSTER_STATS_INTERVAL": "1"})
-        parent = _obs(
-            entity_id="parent", entity_type="Domain-Name",
-            value="evil.com", score=85,
-        )
-        children = [
-            _obs(
-                entity_id=f"child-{i}", entity_type="Domain-Name",
-                value=f"host-{i}.example.com", score=30,
-                labels=[LABEL_FP_CANDIDATE],
-            )
-            for i in range(child_count)
-        ]
-        c.helper.api.stix_cyber_observable.read.return_value = parent
-        c._trust_relationship_children = MagicMock(return_value=children)
-        c._trust_relationship_parents = MagicMock(
-            side_effect=lambda entity_id: [] if entity_id == "parent" else [parent]
-        )
-
-        result = c.process_message({"entity_id": "parent", "entity_type": "Domain-Name"})
-
-        assert len(result) < 250
-        assert f"{child_count} action(s)" in result
-        assert f"children-changed={child_count}" in result
-        assert f"malicious-cascade={child_count}" in result
-        assert f"conflicts={child_count}" in result
-        assert len(c._conflict_noted) <= 10
-        assert len(c.helper.api.note.create.call_args_list) == child_count
-        assert all(
-            call.kwargs["objectRefs"] != ["parent"]
-            for call in c.helper.api.note.create.call_args_list
-        )
-        stats = next(
-            str(call) for call in c.helper.log_info.call_args_list
-            if "stats[last" in str(call)
-        )
-        assert f"cascade_malicious={child_count}" in stats
-        assert f"cascade_conflict={child_count}" in stats
-
-    def test_advisory_note_dedup_state_is_bounded(self, monkeypatch):
-        import connector as _mod
-
-        monkeypatch.setattr(_mod, "_CACHE_MAXSIZE", 3)
-        c = _make_connector()
-        for i in range(5):
-            c._apply_parent_verdict_to_child(
-                _obs(entity_id=f"conflict-{i}", labels=[LABEL_FP_CANDIDATE]),
-                "Domain-Name", "evil.com", 85, "CONFIRMED_MALICIOUS",
-            )
-            c._apply_parent_verdict_to_child(
-                _obs(entity_id=f"revocation-{i}", labels=[LABEL_MALICIOUS_CASCADE]),
-                "Domain-Name", "example.com", 50, "UNKNOWN",
-            )
-
-        assert len(c._conflict_noted) <= 3
-        assert len(c._revocation_noted) <= 3
+        c._get_resolved_ips = MagicMock(return_value=["198.51.100.1"])
+        c.process_message({"entity_id": parent["id"], "entity_type": "Domain-Name"})
+        assert _labels_created(c.helper) == [LABEL_SINKHOLED]
+        assert all("toId" not in call.kwargs for call in c.helper.api.stix_core_relationship.list.call_args_list)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2907,7 +2091,7 @@ OTHER_IP    = "8.8.8.8"
 
 
 class TestSinkhole:
-    """Sinkhole detection — Domain-Name only, label and cascade."""
+    """Direct sinkhole detection; no parent assessment propagation."""
 
     def _con(self, sinkhole: str = SINKHOLE_IP) -> IocTrustClusterConnector:
         return _make_connector({"TRUST_CLUSTER_SINKHOLE_IPS": sinkhole})
@@ -2993,11 +2177,11 @@ class TestSinkhole:
         assert LABEL_SINKHOLED in _labels_created(c.helper)
         assert "sinkholed" in result
 
-    # ── cascade ───────────────────────────────────────────────────────────────
+    # ── parent-context isolation ─────────────────────────────────────────────
 
     @pytest.mark.parametrize("label", [LABEL_SINKHOLE, LABEL_SINKHOLED])
-    def test_sinkhole_parent_cascades_malicious_to_child(self, label):
-        """Either spelling drives one-hop cascade despite a low parent score."""
+    def test_sinkhole_parent_does_not_copy_tags_to_child(self, label):
+        """Either spelling stays on the parent."""
         c = _make_connector({"TRUST_CLUSTER_USE_NS_LOOKUP": "false"})
         child  = _obs(entity_type="Domain-Name", value="cdn.evil.com",  score=50)
         parent = _obs(entity_id="root-001",      entity_type="Domain-Name",
@@ -3006,19 +2190,7 @@ class TestSinkhole:
 
         c.process_message({"entity_id": "obs-001", "entity_type": "Domain-Name"})
 
-        assert LABEL_INHERITED_MALICIOUS_CASCADE in _labels_created(c.helper)
-
-    def test_sinkholed_parent_cascade_color_is_red(self):
-        c = _make_connector({"TRUST_CLUSTER_USE_NS_LOOKUP": "false"})
-        child  = _obs(entity_type="Domain-Name", value="cdn.evil.com",  score=50)
-        parent = _obs(entity_id="root-001",      entity_type="Domain-Name",
-                      value="evil.com", score=20, labels=[LABEL_SINKHOLED])
-        _wire(c, child, parent)
-        c.process_message({"entity_id": "obs-001", "entity_type": "Domain-Name"})
-
-        calls = [cl for cl in c.helper.api.label.create.call_args_list
-                 if (cl.kwargs.get("value") or "") == LABEL_INHERITED_MALICIOUS_CASCADE]
-        assert calls[0].kwargs["color"] == COLOR_MALICIOUS
+        c.helper.api.stix_cyber_observable.add_label.assert_not_called()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3268,23 +2440,23 @@ class TestStats:
             c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
         assert self._stats_lines(c) == []
 
-    def test_stats_counts_cascade_malicious(self):
+    def test_stats_omits_malicious_cascade(self):
         c = _make_connector({"TRUST_CLUSTER_STATS_INTERVAL": "1"})
         child  = _obs(value="1.2.3.4",      score=50)
         parent = _obs(entity_id="cidr-001", value="1.2.3.0/24", score=85)
         _wire(c, child, parent)
         c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
-        assert "cascade_malicious=1" in self._stats_lines(c)[0]
+        assert "cascade_malicious" not in self._stats_lines(c)[0]
 
-    def test_stats_counts_cascade_fp(self):
-        """cascade_fp counts fp-candidate inherited from a CONFIRMED_BENIGN parent."""
+    def test_stats_omits_fp_cascade(self):
+        """Parent assessments no longer have counters."""
         c = _make_connector({"TRUST_CLUSTER_STATS_INTERVAL": "1"})
         child  = _obs(value="1.2.3.4",      score=30)
         parent = _obs(entity_id="cidr-001", value="1.2.3.0/24",
                       score=30, labels=[LABEL_FP_CONFIRMED])
         _wire(c, child, parent)
         c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
-        assert "cascade_fp=1"  in self._stats_lines(c)[0]
+        assert "cascade_fp" not in self._stats_lines(c)[0]
         assert "ubiquity_fp=0" in self._stats_lines(c)[0]
 
     def test_stats_counts_ubiquity_fp(self):
@@ -3298,7 +2470,7 @@ class TestStats:
         c.helper.api.stix_sighting_relationship.list.return_value = [{}, {}]
         c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
         assert "ubiquity_fp=1" in self._stats_lines(c)[0]
-        assert "cascade_fp=0"  in self._stats_lines(c)[0]
+        assert "cascade_fp" not in self._stats_lines(c)[0]
 
     def test_stats_counts_sinkholed(self):
         c = _make_connector({
@@ -3330,17 +2502,17 @@ class TestStats:
         c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
         assert "already_clustered=1" in self._stats_lines(c)[0]
 
-    def test_stats_counts_parent_verdict(self):
-        """parents_malicious incremented when parent is CONFIRMED_MALICIOUS."""
+    def test_stats_omits_parent_verdict(self):
+        """No parent verdict computation or counters remain."""
         c = _make_connector({"TRUST_CLUSTER_STATS_INTERVAL": "1"})
         child  = _obs(value="1.2.3.4",      score=50)
         parent = _obs(entity_id="cidr-001", value="1.2.3.0/24", score=85)
         _wire(c, child, parent)
         c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
-        assert "parents_malicious=1" in self._stats_lines(c)[0]
+        assert "parents_malicious" not in self._stats_lines(c)[0]
 
-    def test_stats_counts_cascade_revoked(self):
-        """B18: cascade_revoked incremented when a revocation advisory is issued."""
+    def test_stats_omits_cascade_revocation(self):
+        """No advisory or automatic retraction remains."""
         c = _make_connector({"TRUST_CLUSTER_STATS_INTERVAL": "1"})
         child = _obs(
             value="1.2.3.4", score=50,
@@ -3354,10 +2526,10 @@ class TestStats:
         _wire(c, child, parent)
         c.helper.api.stix_core_relationship.list.return_value = [_trust_rel(parent)]
         c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
-        assert "cascade_revoked=1" in self._stats_lines(c)[0]
+        assert "cascade_revoked" not in self._stats_lines(c)[0]
 
-    def test_stats_counts_cascade_conflict(self):
-        """B18: cascade_conflict incremented when a conflict note is issued."""
+    def test_stats_omits_cascade_conflict(self):
+        """No cascade-only conflict counters remain."""
         c = _make_connector({"TRUST_CLUSTER_STATS_INTERVAL": "1"})
         child = _obs(
             value="1.2.3.4", score=30,
@@ -3369,7 +2541,7 @@ class TestStats:
         parent = _obs(entity_id="cidr-001", value="1.2.3.0/24", score=85)
         _wire(c, child, parent)
         c.process_message({"entity_id": "obs-001", "entity_type": "IPv4-Addr"})
-        assert "cascade_conflict=1" in self._stats_lines(c)[0]
+        assert "cascade_conflict" not in self._stats_lines(c)[0]
 
     def test_stats_reset_after_interval(self):
         """Counters reset to zero after each interval window."""
