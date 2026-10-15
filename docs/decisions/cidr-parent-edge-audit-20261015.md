@@ -31,6 +31,14 @@ The consumer source had pre-existing uncommitted IOC/workflow changes (fingerpri
 
 The producer now checks same-family **full-network containment** on existing parent selection, legacy hints, discovery and returned lookup endpoints. Invalid contexts produce a warning, cannot repair/create a relationship or attach ASN metadata, and do not trigger automatic replacement. Existing stored edges and independent direct heuristics remain untouched. Missing resolved endpoint identity also fails closed. **291 producer tests pass**, including the cross-repository test against the current consumer source; regression coverage includes IPv4, IPv6, narrowing, literal-IP URLs, malformed endpoints, missing identity and direct ubiquity.
 
+## Guard deployment and verification
+
+Signed commit **`b7bebdb`** was deployed at **15:28:00Z**, recreating **only** IOC Trust Cluster. Image `sha256:02311d249b5ef7896b65396d11d4c56046b0591bb8124264d0f38f40aa2f36bf`; source SHA-256 `6b2c855842842149134a3ff0922d021a9f705c445ea96e1d04817aa6f06e1347` matches the checkout. Same connector identity, 274 existing ASN-backed anchors loaded, one running writer, zero ready/unacknowledged messages before/after. The deployed pure guard rejected **37/37** recorded invalid cases without invoking the connector constructor, processing messages or any mutation API.
+
+A fresh live audit through `http://opencti:8080` verified **identical decoded JSON values for all 1,030 relationship/endpoint records** to the initial native snapshot, with the same 37 invalid edges left in place. This proves preservation of those graph/direct-evidence records, not a global transaction or all unrelated state. A normal queued IPv6 work item was observed during restart, including the retained graph audit-Note behavior; no work was dispatched by this audit. No invalid edge was repaired or removed.
+
+Rollback: prior image `sha256:568dc78e4696b5fc27fc697bf9aba84eeaecb0f836f6ea6bceaf12ed27eef6df` retained as **`ioc-trust-cluster:pre-dft`**. If needed, use an external temporary compose override setting only `services.connector-ioc-trust-cluster.image` to that tag, then `docker compose -p xtm -f docker-compose.yml -f /tmp/dft-rollback.yml up -d --no-deps --no-build --pull never connector-ioc-trust-cluster`. This rolls back code only; no data rollback is currently necessary. Unrelated OpenCTI and ShellShock worktree diffs remained byte-identical to their pre-task snapshots.
+
 ## Review manifest and bounded repair proposal — NOT APPROVED
 
 - **37 mathematically invalid edges** are review items, not authenticated connector-owned deletion candidates. The report has `mutation_authorized=false`, `apply_limit=0`. No apply tool was built or run.
@@ -53,4 +61,4 @@ Saved privately outside git at `/home/x0r/.local/state/open-cti/dft-20261015/`, 
 | `dft-full-edge-export.jsonl` | `80625824ebb4b02bf1b1b35e442e4303d4ebb42a0c98d43fdcf676779b26a186` |
 | `dft-consumer-impact.json` | `84ce68438f66d55c4458c65fb8d0b92637d0941c68dfb1bce6453591d37002c4` |
 
-`dft-review-manifest.json`, RDAP summaries, reference responses and source-history snapshots accompany these exports. Reproduce future live/offline inventories with `connectors/ioc-trust-cluster/scripts/audit_cidr_parent_edges.py`; it has no mutation mode and reports incomplete scans explicitly.
+`dft-review-manifest.json`, RDAP summaries, reference responses and source-history snapshots accompany these exports. The final source-bound review is `dft-postdeployment-manifest.json`; final raw snapshot SHA-256 `e1aef4a6d08244928176630ce43dba0c07acdeec2ad9a3a103a290a9f7292485`. `dft-deployment-verification.json`, runtime guard proof, queue snapshots and rollout logs record the deployment. Reproduce future live/offline inventories with `connectors/ioc-trust-cluster/scripts/audit_cidr_parent_edges.py`; it has no mutation mode and reports incomplete scans explicitly.
