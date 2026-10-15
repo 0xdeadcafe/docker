@@ -269,7 +269,7 @@ services:
       - OPENCTI_TOKEN=${OPENCTI_ADMIN_TOKEN}
       - CONNECTOR_ID=${CONNECTOR_IOC_TRUST_CLUSTER_ID}
       - CONNECTOR_NAME=IOC Trust Cluster
-      - CONNECTOR_AUTO=true
+      - CONNECTOR_AUTO=false
       - CONNECTOR_CONFIDENCE_LEVEL=75
       - CONNECTOR_LOG_LEVEL=info
     restart: always
