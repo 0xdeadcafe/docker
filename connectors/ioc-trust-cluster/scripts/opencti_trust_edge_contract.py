@@ -1,18 +1,10 @@
 #!/usr/bin/env python3
-"""Opt-in OpenCTI contract smoke test for IOC trust edges.
+"""Opt-in MUTATING smoke for an approved disposable OpenCTI stack only.
 
-Requires a running OpenCTI (for example this repo's compose stack) and:
-  OPENCTI_URL=http://localhost:8080
-  OPENCTI_TOKEN=<admin/api token>
-
-Optional:
-  CONNECTOR_ID=<uuid>              (defaults to a fixed smoke-test UUID)
-  TRUST_CONTRACT_KEEP=1            keep created observables/relationships
-
-Run from repo root:
-  python3 connectors/ioc-trust-cluster/scripts/opencti_trust_edge_contract.py
+Requires OPENCTI_URL, OPENCTI_TOKEN, TRUST_CONTRACT_DISPOSABLE=1 and all
+INTERNAL_ENRICHMENT connectors' automatic triggers disabled. Never a unit test.
+TRUST_CONTRACT_KEEP=1 retains randomized fixtures for inspection.
 """
-
 from __future__ import annotations
 
 import os
@@ -22,8 +14,7 @@ import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
-SRC = ROOT / "connectors" / "ioc-trust-cluster" / "src"
-sys.path.insert(0, str(SRC))
+sys.path.insert(0, str(ROOT / "connectors/ioc-trust-cluster/src"))
 
 
 def require_env(name: str) -> str:
@@ -34,176 +25,109 @@ def require_env(name: str) -> str:
 
 
 def label_values(entity: dict) -> set[str]:
-    return {lbl.get("value", "") for lbl in (entity.get("objectLabel") or [])}
+    return {label["value"] for label in entity.get("objectLabel") or []}
 
 
-def endpoint_id(rel: dict, side: str) -> str | None:
-    return rel.get(f"{side}Id") or (rel.get(side) or {}).get("id")
+def snapshot(api, obj_id: str) -> tuple:
+    entity = api.stix_cyber_observable.read(id=obj_id)
+    return entity.get("x_opencti_score"), sorted(label_values(entity))
 
 
-def wait_for_label(api, observable_id: str, value: str, present: bool = True) -> dict:
+def wait_for_label(api, obj_id: str, value: str, present: bool) -> None:
     for _ in range(20):
-        entity = api.stix_cyber_observable.read(id=observable_id)
-        if (value in label_values(entity)) is present:
-            return entity
+        if (value in label_values(api.stix_cyber_observable.read(id=obj_id))) == present:
+            return
         time.sleep(0.25)
-    raise AssertionError(f"label {value!r} did not become present={present}")
+    raise AssertionError(f"fixture label did not become present={present}")
 
 
-def create_domain(api, value: str, score: int) -> dict:
-    return api.stix_cyber_observable.create(
-        observableData={
-            "type": "domain-name",
-            "value": value,
-            "x_opencti_score": score,
-            "x_opencti_description": "IOC trust-cluster contract smoke test fixture",
-        },
-        update=True,
-    )
+def require_isolated_stack(api) -> None:
+    if os.environ.get("TRUST_CONTRACT_DISPOSABLE") != "1":
+        raise SystemExit("requires explicit TRUST_CONTRACT_DISPOSABLE=1 for an approved disposable stack")
+    data = api.query("query { connectorsForWorker { id name active auto connector_type } }")
+    connectors = (data.get("data") or {}).get("connectorsForWorker")
+    if connectors is None:
+        raise SystemExit("cannot verify automatic enrichment suppression")
+    automatic = [c["name"] for c in connectors
+                 if c.get("connector_type") == "INTERNAL_ENRICHMENT" and c.get("auto") is not False]
+    if automatic:
+        raise SystemExit("disable all automatic internal enrichment before smoke: " + ", ".join(automatic))
 
 
 def main() -> None:
-    url = require_env("OPENCTI_URL")
-    token = require_env("OPENCTI_TOKEN")
-
-    from connector import (  # noqa: WPS433 - opt-in script, fail only when run
-        CLUSTER_LABEL_PREFIX,
-        COLOR_CLUSTER,
-        COLOR_FP,
-        LABEL_FP_CONFIRMED,
-        LABEL_INHERITED_FP_CANDIDATE,
-        LABEL_INHERITED_MALICIOUS_CASCADE,
-        TRUST_REL_DESCRIPTION,
-        TRUST_REL_TYPE,
-        IocTrustClusterConnector,
-    )
-    from pycti import OpenCTIApiClient  # noqa: WPS433
-
-    os.environ.setdefault("CONNECTOR_ID", "6bb7c2ca-956b-4d80-8d59-44e05f99fe7a")
-    os.environ.setdefault("TRUST_CLUSTER_USE_RDAP", "false")
-    os.environ.setdefault("TRUST_CLUSTER_USE_NS_LOOKUP", "false")
-    os.environ.setdefault("TRUST_CLUSTER_STATS_INTERVAL", "0")
+    url, token = require_env("OPENCTI_URL"), require_env("OPENCTI_TOKEN")
+    from connector import IocTrustClusterConnector, TRUST_REL_TYPE, TRUST_REL_DESCRIPTION
+    from pycti import OpenCTIApiClient
 
     api = OpenCTIApiClient(url, token)
+    require_isolated_stack(api)  # Before connector registration or any observable writes.
+    os.environ.setdefault("CONNECTOR_ID", "6bb7c2ca-956b-4d80-8d59-44e05f99fe7a")
+    os.environ["CONNECTOR_AUTO"] = "false"
+    os.environ["TRUST_CLUSTER_USE_RDAP"] = "false"
+    os.environ["TRUST_CLUSTER_USE_NS_LOOKUP"] = "false"
+    os.environ["TRUST_CLUSTER_SINKHOLE_IPS"] = ""
+    os.environ["TRUST_CLUSTER_STATS_INTERVAL"] = "0"
     suffix = uuid.uuid4().hex[:12]
-    child_value = f"trust-contract-child-{suffix}.example.com"
-    parent_value = f"trust-contract-parent-{suffix}.example.com"
-    benign_child_value = f"trust-contract-benign-child-{suffix}.example.com"
-    benign_parent_value = f"trust-contract-benign-parent-{suffix}.example.com"
-    contract_label = f"{CLUSTER_LABEL_PREFIX}:contract:{suffix}"
-
-    rel_ids: list[str] = []
-    obs_ids: list[str] = []
-    contract_label_id: str | None = None
+    obs_ids, rel_ids, label_ids = [], [], []
     connector = None
-    keep = os.environ.get("TRUST_CONTRACT_KEEP", "").lower() in {"1", "true", "yes"}
-
     try:
-        child = create_domain(api, child_value, 50)
-        parent = create_domain(api, parent_value, 85)
-        benign_child = create_domain(api, benign_child_value, 50)
-        benign_parent = create_domain(api, benign_parent_value, 20)
-        obs_ids.extend([
-            child["id"], parent["id"], benign_child["id"], benign_parent["id"]
-        ])
-
-        fp_label = api.label.create(value=LABEL_FP_CONFIRMED, color=COLOR_FP)
-        assert api.stix_cyber_observable.add_label(
-            id=benign_parent["id"], label_id=fp_label["id"]
-        )
-        benign_parent = wait_for_label(
-            api, benign_parent["id"], LABEL_FP_CONFIRMED
-        )
-
-        rel = api.stix_core_relationship.create(
-            fromId=child["id"],
-            toId=parent["id"],
-            relationship_type=TRUST_REL_TYPE,
-            description=TRUST_REL_DESCRIPTION,
-            confidence=75,
-        )
-        extra_rel = api.stix_core_relationship.create(
-            fromId=child["id"],
-            toId=benign_parent["id"],
-            relationship_type=TRUST_REL_TYPE,
-            description=TRUST_REL_DESCRIPTION,
-            confidence=75,
-        )
-        benign_rel = api.stix_core_relationship.create(
-            fromId=benign_child["id"],
-            toId=benign_parent["id"],
-            relationship_type=TRUST_REL_TYPE,
-            description=TRUST_REL_DESCRIPTION,
-            confidence=75,
-        )
-        rel_ids.extend([rel["id"], extra_rel["id"], benign_rel["id"]])
-
-        rels = api.stix_core_relationship.list(
-            fromId=child["id"],
-            relationship_type=TRUST_REL_TYPE,
-            first=1,
-            getAll=True,
-        )
-        assert len(rels) >= 2, "pycti getAll pagination did not return both relationships"
-        listed = next(r for r in rels if r["id"] == rel["id"])
-        assert TRUST_REL_DESCRIPTION in (listed.get("description") or "")
-        assert endpoint_id(listed, "from") == child["id"]
-        assert endpoint_id(listed, "to") == parent["id"]
-        assert (listed.get("to") or {}).get("observable_value") == parent_value
-
-        label = api.label.create(value=contract_label, color=COLOR_CLUSTER)
-        contract_label_id = label["id"]
-        assert api.stix_cyber_observable.add_label(id=child["id"], label_id=label["id"])
-        wait_for_label(api, child["id"], contract_label)
-        assert api.stix_cyber_observable.remove_label(id=child["id"], label_id=label["id"])
-        wait_for_label(api, child["id"], contract_label, present=False)
-
         connector = IocTrustClusterConnector()
-        # The contract is for trust edges/labels; avoid leaving audit Note fixtures.
-        connector._create_audit_note = lambda *args, **kwargs: None
-
-        benign_result = connector.process_message(
-            {"entity_id": benign_child["id"], "entity_type": "Domain-Name"}
-        )
-        benign_labels = label_values(wait_for_label(
-            api, benign_child["id"], LABEL_INHERITED_FP_CANDIDATE
-        ))
-        assert LABEL_INHERITED_FP_CANDIDATE in benign_labels, benign_result
-        assert "fp-candidate inherited" in benign_result
-
-        malicious_result = connector.process_message(
-            {"entity_id": child["id"], "entity_type": "Domain-Name"}
-        )
-        malicious_labels = label_values(wait_for_label(
-            api, child["id"], LABEL_INHERITED_MALICIOUS_CASCADE
-        ))
-        assert f"{CLUSTER_LABEL_PREFIX}:{parent_value}" not in malicious_labels
-        assert LABEL_INHERITED_MALICIOUS_CASCADE in malicious_labels
-        assert LABEL_INHERITED_FP_CANDIDATE not in malicious_labels
-        assert "malicious-cascade" in malicious_result
-
-        print("ok: OpenCTI trust-edge and trust-state contracts passed")
+        connector._create_audit_note = lambda *args: None  # Do not leave Note fixtures.
+        connector._get_sightings_count = lambda *args: 0
+        for parent_score, tag in [(85, "malicious"), (0, "fp-confirmed")]:
+            objects = []
+            for role, score in [("child", 0), ("parent", parent_score)]:
+                obj = api.stix_cyber_observable.create(observableData={
+                    "type": "domain-name", "value": f"{role}-{parent_score}-{suffix}.example.com",
+                    "x_opencti_score": score,
+                    "x_opencti_description": "IOC trust-cluster disposable contract fixture",
+                })
+                obs_ids.append(obj["id"])
+                objects.append(obj)
+            child, parent = objects
+            # Confine discovery to disposable objects, never the real example.com anchor.
+            connector._extract_parent = lambda *args: ("Domain-Name", parent["observable_value"])
+            direct_before = snapshot(api, child["id"])
+            result = connector.process_message({"entity_id": child["id"], "entity_type": "Domain-Name"})
+            assert "linked under" in result
+            relationships = api.stix_core_relationship.list(
+                fromId=child["id"], relationship_type=TRUST_REL_TYPE, first=1, getAll=True)
+            owned = [r for r in relationships if r.get("description") == TRUST_REL_DESCRIPTION]
+            rel_ids.extend(r["id"] for r in owned)
+            assert len(owned) == 1
+            assert (owned[0].get("toId") or (owned[0].get("to") or {}).get("id")) == parent["id"]
+            label = api.label.create(value=f"contract:{suffix}:{tag}", color="#1565c0")
+            label_ids.append(label["id"])
+            for present in [True, False]:
+                operation = api.stix_cyber_observable.add_label if present else api.stix_cyber_observable.remove_label
+                operation(id=parent["id"], label_id=label["id"])
+                wait_for_label(api, parent["id"], label["value"], present)
+                connector.process_message({"entity_id": child["id"], "entity_type": "Domain-Name"})
+                assert snapshot(api, child["id"]) == direct_before
+            # Exercise actual direct parent assessment without copying it to the child.
+            direct_tag = api.label.create(value=tag, color="#1565c0")
+            api.stix_cyber_observable.add_label(id=parent["id"], label_id=direct_tag["id"])
+            wait_for_label(api, parent["id"], tag, True)
+            connector.process_message({"entity_id": child["id"], "entity_type": "Domain-Name"})
+            connector.process_message({"entity_id": parent["id"], "entity_type": "Domain-Name"})
+            assert snapshot(api, child["id"]) == direct_before
+            again = api.stix_core_relationship.list(
+                fromId=child["id"], relationship_type=TRUST_REL_TYPE, first=1, getAll=True)
+            assert {r["id"] for r in again} == {r["id"] for r in relationships}
+        print("ok: directed edges/idempotency; parent tag changes never change child labels/score")
     finally:
         if connector is not None:
             connector.helper.stop()
-        if keep:
-            print(f"kept fixtures: {', '.join(obs_ids)}")
-            return
-        for rel_id in reversed(rel_ids):
-            try:
-                api.stix_core_relationship.delete(id=rel_id)
-            except Exception:
-                pass
-        for obs_id in reversed(obs_ids):
-            try:
-                api.stix_cyber_observable.delete(id=obs_id)
-            except Exception:
-                pass
-        if contract_label_id:
-            try:
-                api.label.delete(id=contract_label_id)
-            except Exception:
-                pass
+        if os.environ.get("TRUST_CONTRACT_KEEP") == "1":
+            print("kept disposable fixtures: " + ", ".join(obs_ids))
+        else:
+            for resource, ids in [(api.stix_core_relationship, rel_ids),
+                                  (api.stix_cyber_observable, obs_ids), (api.label, label_ids)]:
+                for obj_id in reversed(ids):
+                    try:
+                        resource.delete(id=obj_id)
+                    except Exception as exc:
+                        print(f"fixture cleanup failed for {obj_id}: {type(exc).__name__}", file=sys.stderr)
 
 
 if __name__ == "__main__":

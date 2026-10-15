@@ -1,77 +1,73 @@
 # IOC Trust Cluster
 
-Single OpenCTI connector for IOC trust edges and one-hop verdict fanout.
+Build structural IOC relationships; retrieve parent context instead of copying it.
 
-## Trust edges vs label-only grouping
+## Contract
 
-Only relationship-backed parent observables (`IPv4-Addr`, `IPv6-Addr`, `Domain-Name`) participate in trust edges and verdict fanout. Structural trust is graph-only: child observables link to parent observables with connector-owned `related-to` relationships because OpenCTI rejects `belongs-to` for SCO parentage pairs such as IP→CIDR, URL→host, and subdomain→domain. CIDR anchors link to AS observables with `belongs-to`, where OpenCTI allows ownership semantics. See `docs/decisions/trust-parent-relationship-semantics.md`. X509 issuer-DN strings are not stable certificate identities, so the connector does not create synthetic CA parents. `Network-Traffic` JA4 profiles and direct `Autonomous-System` owner grouping remain label-only display aids; they never cascade verdicts.
+- IP → RDAP CIDR and domain/URL → discovered parent use child-to-parent `related-to` with description exactly `IOC trust-cluster structural parent link (auto-created)`.
+- CIDR → `Autonomous-System` uses `belongs-to` with the existing ownership marker. OpenCTI rejects `belongs-to` for the SCO parentage pairs above.
+- Synthetic UNKNOWN network/domain anchors start at score `0`. No guessed `/24` or `/48`, new client-side RDAP, or synthetic X509 issuer-DN objects.
+- Existing relationships are reused without parent verdict classification or descendant enumeration. Parent updates do not copy tags, change child scores, retract labels, or create cascade/conflict/revocation Notes.
+- Independent features remain: sighting-based generic `fp-candidate`, optional direct `sinkholed` detection (`sinkhole` feed alias preserved), opt-in NS discovery, label-only JA4/ASN-owner groups and graph-change audit Notes.
+- Historical `trust-cluster:malicious-cascade` / `trust-cluster:fp-candidate` associations stay untouched. Generic/manual tags, scores, relationships and historical Notes are never migration targets here.
 
-Inherited verdict labels are namespaced (`trust-cluster:malicious-cascade`, `trust-cluster:fp-candidate`) so the connector can remove only state it owns. Generic `malicious-cascade` / `fp-candidate` labels from analysts, feeds, or old runs are never auto-removed.
+See [relationship semantics](../../docs/decisions/trust-parent-relationship-semantics.md). The connector ID and relationship markers are unchanged. The retired `TRUST_CLUSTER_FP_CASCADE_SCORE_MAX` setting has no effect. Malicious/unknown score thresholds still guard independent direct heuristics.
 
-DNS NS parent discovery is opt-in (`TRUST_CLUSTER_USE_NS_LOOKUP=true` or `TRUST_CLUSTER_USE_NS=true`). The default avoids cross-tenant NS-provider clusters.
+## Retrieval
 
-## Deployment
-
-`ioc-trust-cluster` is the deployment unit for trust-chain behavior. The old standalone `parent-promoter` worker was removed and is not wired separately.
-
-The feed label `sinkhole` and the connector label `sinkholed` are compatibility aliases. Either is a direct malicious assessment regardless of score and drives the same one-hop verdict fanout. The connector creates only the canonical `sinkholed` spelling and does not add it when either alias is already present.
-
-## Trust-state activation workflow
-
-Direct assessments are inputs:
-
-- An analyst or trusted feed applies `fp-confirmed` to a parent that is known benign.
-- A feed may apply `sinkhole`; the connector applies `sinkholed` when DNS resolves to a configured sinkhole IP.
-- A parent score at or above `TRUST_CLUSTER_MALICIOUS_SCORE_MIN` (default `70`) is a direct malicious assessment unless the parent itself carries an inherited cascade label.
-
-The connector alone owns the inherited outputs `trust-cluster:fp-candidate` and `trust-cluster:malicious-cascade`. Analysts and feeds should not apply those labels directly. Generic unnamespaced `fp-candidate` and `malicious-cascade` labels are legacy/manual state and are not automatically removed.
-
-Propagation requires a connector-owned child→parent `related-to` relationship. Only real `IPv4-Addr`, `IPv6-Addr`, and `Domain-Name` parents participate; label-only ASN/JA4 groups do not. A benign parent must carry `fp-confirmed` and remain below the malicious threshold. Its child must be at or below `TRUST_CLUSTER_FP_CASCADE_SCORE_MAX` (default `50`), below the malicious threshold, and have no malicious cascade label or linked high-score Indicator. A directly malicious or sinkhole parent applies inherited malicious state to each direct child. Unknown and inherited-only parents do not fan out, and propagation is one hop.
-
-Zero assignments are therefore valid when no parent has a direct assessment, no eligible child relationship exists, or the connector has not received a parent/child update event. Synthetic UNKNOWN parent anchors are created with score `0`; OpenCTI's score `50` is not used because downstream clients commonly treat it as suspicious.
-
-Legacy synthetic anchors can be migrated safely after reviewing a dry run:
+ShellShock's `opencti-ioc` retains `verdict`, `requested_ioc_verdict`, `ioc_verdicts`, direct labels and exact verdict-cache evidence regardless of parent expansion:
 
 ```sh
-python3 connectors/ioc-trust-cluster/scripts/migrate_unknown_anchor_scores.py dry-run
-python3 connectors/ioc-trust-cluster/scripts/migrate_unknown_anchor_scores.py apply
-python3 connectors/ioc-trust-cluster/scripts/migrate_unknown_anchor_scores.py verify
+opencti-ioc.sh --ioc "$IOC" --json --raw-dir /tmp/parent-read \
+  --include-trust-parents --trust-parent-depth 3 --trust-parent-fanout 10 \
+  > /tmp/parent-read.json 2>/tmp/parent-read.err
 ```
 
-The migration requires `OPENCTI_URL` and `OPENCTI_TOKEN`. It changes only score-50 observables with the exact generated anchor description and no labels, indicators, external references, or creator; every candidate is re-read immediately before update.
+Do **not** add `--enrich-on-miss` for verification. `belong_to_parents` carries raw parent tags, IDs, relationship ID/direction/description, depth/path, freshness and provenance. `strongest_trust_parent_verdict` summarizes only approved outgoing graph parents, never the requested IOC. Generic/incoming links are `related_context`; URL-host/DNS-derived context stays in `trust_parent_verdicts` / `trust_graph`, not established ownership. Check `belong_to_graph.complete`, `incomplete_reasons` and uncertainty before interpreting absent parents. SCO confidence is unavailable and remains null.
 
-## Optional OpenCTI contract smoke test
+## CIDR discovery
 
-The fast unit tests stay mocked and Docker-free. To verify the real compose OpenCTI API accepts the trust-edge contract, run the opt-in smoke test against a running stack:
+1. Load connector-marked CIDR→ASN `belongs-to` edges into a bounded session prefix index.
+2. Reuse the most-specific indexed CIDR containing an IP without another RDAP request.
+3. Otherwise ask IPWhois/RDAP for the most-specific valid `network.cidr` / `asn_cidr` containing the IP.
+4. Find/create the CIDR, link it to its ASN when available and cache the chain.
+5. Without an actual allocation, return no parent. Never manufacture a prefix.
+
+NS discovery remains opt-in (`TRUST_CLUSTER_USE_NS_LOOKUP=true` or `TRUST_CLUSTER_USE_NS=true`) to avoid cross-tenant provider clusters.
+
+## Release checks
 
 ```sh
-export OPENCTI_URL=http://localhost:8080
-export OPENCTI_TOKEN=<admin/api token>
-python3 connectors/ioc-trust-cluster/scripts/opencti_trust_edge_contract.py
+OPENCTI_CONSUMER_SCRIPT=/home/x0r/ShellShock/skel/.pi/skills/opencti-ioc/scripts/opencti_ioc.py \
+  python3 -m pytest -q connectors/ioc-trust-cluster/tests
+python3 -m pytest -q /home/x0r/ShellShock/skel/.pi/skills/opencti-ioc/tests
 ```
 
-Optional: set `CONNECTOR_ID` to the connector UUID and `TRUST_CONTRACT_KEEP=1` to keep the temporary observables for inspection. Without that flag, the script uses randomized temporary Observables and removes them and their relationships afterward; it does not alter existing IOC verdicts. It verifies both an `fp-confirmed` parent→eligible-child transition and a directly malicious parent→child transition, forces pycti pagination with `first=1,getAll=True`, and checks connector-owned label add/remove behavior.
+The cross-repository test consumes actual producer-created IP→non-/24 CIDR→ASN edges and rereads added/removed parent tags while direct evidence stays invariant. All tests are hermetic; no paid enrichment.
 
-## CIDR parent rule
+The optional **mutating** `scripts/opencti_trust_edge_contract.py` is only for an explicitly approved disposable stack. Set `OPENCTI_URL`, `OPENCTI_TOKEN` and `TRUST_CONTRACT_DISPOSABLE=1`; first disable **all** automatic internal-enrichment triggers (including this connector). The script verifies suppression before creating fixtures; this prevents observable creation from spending provider quota. Do not run it against production as a routine check. It confines discovery to randomized fixtures, checks directed edges/idempotency and unchanged child tags/scores under malicious/benign parent changes, then cleans its fixture objects/edges. `TRUST_CONTRACT_KEEP=1` retains fixtures and still reports assertion failures. No live mutating smoke was used for this release.
 
-For IP observables, CIDR trust parents are ASN/RDAP-derived:
+## Consumer-first rollout and rollback
 
-1. Load connector-owned CIDR→ASN `belongs-to` edges into a bounded in-memory prefix index when the connector starts.
-2. Reuse the most-specific indexed CIDR containing a new IP, without another RDAP request.
-3. On an index miss, query IPWhois/RDAP for the announced/allocation CIDR (`network.cidr` / `asn_cidr`).
-4. If multiple CIDRs are returned, use the most-specific valid CIDR that contains the IP.
-5. Reuse the matching OpenCTI CIDR observable when it exists, or create it when absent.
-6. Link RDAP-derived CIDRs to their ASN and add them to the session index.
-7. If ASN/RDAP has no usable CIDR, do not invent a `/24` or `/48` trust parent by default.
+Implementation references: producer `81c81ec`; consumer `5cd7e849` (direct verdict isolation), `53de26c3` (bounded directed graph context). Include subsequent contract/docs fixes when selecting release heads.
 
-Only CIDRs with this connector's CIDR→ASN relationship are indexed; arbitrary feed-created CIDRs are ignored. OpenCTI stores/reuses CIDR observables, while the trusted graph edge or RDAP chooses the CIDR shape.
+1. Record consumer commit, bind mounts, producer image/connector ID/settings, current connector work and queue depth. Save read-only baseline JSON for a real IP→CIDR→ASN chain, a tagged parent and a missing-parent example. Do not print tokens.
+2. Deliver the consumer first. This checkout's workbench binds `/home/x0r/ShellShock/skel` to `/home/analyst`; verify the actual deployment's mount/version instead of assuming every workbench updates automatically. Preserve a stopped workbench's state. Run the deployed CLI or identical bind-mounted source against the existing API, expansion off/on, saving JSON before comparison. Confirm direct verdict/labels/cache evidence agree and inspect graph provenance/limits. No observable creation, `askEnrichment`, paid requests or tag changes.
+3. Only after that passes, preserve the old producer image and recreate **only** this service:
 
-## Legacy structural label cleanup
+   ```sh
+   docker image tag "$(docker inspect -f '{{.Image}}' xtm-connector-ioc-trust-cluster-1)" ioc-trust-cluster:pre-r2f
+   docker compose -p xtm -f docker-compose.yml build connector-ioc-trust-cluster
+   docker compose -p xtm -f docker-compose.yml up -d --no-deps --no-build connector-ioc-trust-cluster
+   ```
 
-Structural `trust-cluster:<parent>` labels are obsolete now that connector-owned relationships are authoritative. Audit them before cleanup:
+   Do not recreate the platform or include unrelated platform/work-ID work. Confirm registration/unchanged connector identity, one writer instance, its source hash/image and work/queue health. Read-only verification cannot prove a newly dispatched processing event; source/tests plus runtime version prove the removed writer paths without manufacturing live work.
+4. Repeat read-only comparisons, refresh the exact inherited-label association inventory, and record evidence/versions in `open-cti-r2f.7` / `.8`. Zero candidates means a verified no-op, not permission to delete definitions. Nonzero/ambiguous assignments require a new ownership review, rollback export and explicit approval after showing the dry run.
 
-```sh
-python3 connectors/ioc-trust-cluster/scripts/cleanup_structural_labels.py dry-run
-```
+Rollback only affected components: restore consumer files from pre-change `1acc6a9c` (or the recorded deployment baseline) and rerun read-only verification; restore the saved producer image with a temporary compose override `services.connector-ioc-trust-cluster.image: ioc-trust-cluster:pre-r2f` and `up -d --no-deps --no-build --pull never connector-ioc-trust-cluster`. Keep the override outside the repository. Rolling back the producer re-enables inheritance; leave all legacy data unchanged and do not run cleanup. Never roll back unrelated dirty files or erase evidence.
 
-`dry-run` reads the authoritative `object-label` relationship index, covering every OpenCTI object type. `apply` removes an association only when the exact connector-owned structural relationship exists, then rechecks OpenCTI immediately before deleting each unreferenced definition. Inherited state labels, ASN-owner labels, TLS-profile labels, and any referenced/manual labels are preserved. Use `--limit N` for a bounded apply and `verify` afterward; `apply` requires `OPENCTI_URL` and `OPENCTI_TOKEN`. For strict protection against a new label assignment in the final check/delete window, pause label-writing connectors and analyst changes during `apply`.
+## Legacy migrations (separate approvals)
+
+`cleanup_structural_labels.py` removes a different obsolete structural-label class and explicitly protects both inherited-state labels; do not relax those safeguards. `migrate_unknown_anchor_scores.py` is a separate score-50 anchor migration with its own dry-run/apply/verify guards. Neither is run by this rollout.
+
+Read-only inventory at **2026-10-15T14:25:32Z** found **0 inherited-label associations**, across all object types/index generations; both label definitions remain. Exact counts, no shard failures/timeouts. Evidence: `/tmp/r2f-inherited-inventory-{raw,summary}.json`; raw SHA-256 `e60c9128dd56f3e851666151f874cbe6502617bb7f528ca667f8ef75f921dfb7`. No cleanup tool was built for an empty inventory. This pre-rollout result must be refreshed after the old writer stops.
