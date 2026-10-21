@@ -388,7 +388,7 @@ services:
       - CONNECTOR_NAME=VirusTotal
       # URL lookups provide an on-demand alternative when IPQS is unavailable.
       # Uploads remain disabled, so unseen URLs are never submitted to VT.
-      - CONNECTOR_SCOPE=StixFile,Artifact,IPv4-Addr,IPv6-Addr,Domain-Name,Url
+      - CONNECTOR_SCOPE=StixFile,Artifact,IPv4-Addr,Domain-Name,Url
       # Paid enrichment is user-requested through OpenCTI UI/GraphQL only.
       - CONNECTOR_AUTO=false
       - CONNECTOR_AUTO_UPDATE=false
