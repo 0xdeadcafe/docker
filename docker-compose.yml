@@ -380,7 +380,7 @@ services:
         condition: service_healthy
 
   connector-virustotal:
-    image: opencti/connector-virustotal:7.260910.0
+    image: local/connector-virustotal-validity:7.260910.0
     environment:
       - OPENCTI_URL=http://opencti:8080
       - OPENCTI_TOKEN=${OPENCTI_ADMIN_TOKEN}
